@@ -2,15 +2,18 @@
 
 # LocalWispr
 
-Push-to-talk dictation for Windows in one 104 KB native executable. It's a minimal take on
+Push-to-talk dictation for Windows in one 110 KB native executable. It's a minimal take on
 [OpenWhispr](https://github.com/OpenWhispr/openwhispr) that does only the parts I use.
 
 | Keys | What happens |
 | --- | --- |
 | Hold **Left Ctrl + Win**, talk, release | Records, transcribes with OpenAI, cleans up the text, and pastes it into the focused app |
-| Hold **Left Ctrl + Win + Alt** | Shows your last 5 dictations. **Up/Down** picks one; releasing copies it to the clipboard. **Esc** cancels. |
+| **Tap** Left Ctrl + Win | Hands-free: keeps recording while you click and type in other windows. **Tap Ctrl + Win again** to finish; the text goes into whatever field is focused then. |
+| Hold **Left Ctrl + Win + Alt** | Shows your last 5 dictations. **Up/Down** picks one; releasing copies it to the clipboard. **Esc** cancels. **Right** opens the dictionary window. |
 
-Ctrl + Win + any other key (for example Ctrl+Win+Left to switch desktops) cancels the recording.
+A tap is a press shorter than 350 ms (`[hotkey] tap_ms`). During a hold, Ctrl + Win + any other key
+(for example Ctrl+Win+Left to switch desktops) cancels the recording. During hands-free, those
+shortcuts pass through and recording carries on, and Ctrl + Win + Alt throws the recording away.
 The Start menu doesn't open. After pasting, whatever was on your clipboard before (text, files,
 images) is put back one second later.
 
@@ -31,8 +34,18 @@ to the dictionary and a pill says "Added to dictionary: Sinead". A word only cou
 - you didn't rewrite most of the text.
 
 This is the same rule OpenWhispr uses. It still learns if you fix the word and press Enter right
-away. Half-typed words are ignored. Turn it off with `[dictionary] auto_learn=0`, and edit or prune
-the list from the tray menu (Edit dictionary).
+away. Half-typed words are ignored. Learned words are tagged `# learned` in the file. Turn learning
+off with `[dictionary] auto_learn=0`.
+
+**Editing.** Press Right in the Ctrl+Win+Alt popup (or use the tray menu → Edit dictionary) to open
+the dictionary window. It stays open after you let go:
+
+- Type a word and press Enter to add it.
+- Up/Down picks a word. Newest words are at the top, and learned ones are marked.
+- Delete removes the picked word. Esc closes the window.
+- **Open file** opens `dictionary.txt` in Notepad for bulk edits.
+
+The window is destroyed when it closes. While open it adds about 0.5 MB.
 
 The watching runs in a short-lived child process (`localwispr.exe --watch`) that reads the field
 through Windows UI Automation. It exits after 30 seconds, or as soon as you dictate again, so UI
@@ -77,8 +90,8 @@ launches it. The tray icon (blue = idle, red = recording, amber = transcribing) 
 
 Everything lives in `%APPDATA%\LocalWispr`. Changes apply on the next dictation; no restart needed.
 
-- `config.ini`: API key, models, language, and `auto_learn`. Set `[cleanup] enabled=0` to paste
-  the raw transcript.
+- `config.ini`: API key, models, language, `tap_ms`, and `auto_learn`. Set `[cleanup] enabled=0`
+  to paste the raw transcript.
 - `dictionary.txt`: your word list (newest entries last; the newest 800 characters go to the
   transcriber, up to 6,000 to cleanup).
 - `prompt.txt`: the cleanup prompt.

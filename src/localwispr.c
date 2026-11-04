@@ -43,6 +43,7 @@
 #define TAIL_MS       150                        /* keep recording briefly after release */
 #define RESTORE_MS    1000                       /* restore the clipboard this long after pasting */
 #define HIST_N        5
+#define TAP_MS_DEFAULT 350                       /* Ctrl+Win released sooner than this = tap = hands-free */
 #define WATCH_MS      30000                      /* how long to watch the field after a paste */
 #define WATCH_POLL_MS 250
 #define DICT_PROMPT_CHARS 800                    /* dictionary words sent to the transcriber */
@@ -50,9 +51,10 @@
 #define LW_COPYDATA_LEARNED 0x4C57               /* WM_COPYDATA tag: watcher -> app */
 
 enum { WM_TRAY = WM_APP + 1, WM_REC_START, WM_REC_STOP, WM_HIST_SHOW, WM_HIST_MOVE,
-       WM_HIST_END, WM_JOB_DONE, WM_JOB_ERROR };
-enum { T_REC = 1, T_TAIL, T_PASTE, T_RESTORE, T_MSG, T_TRIM };
-enum { M_IDLE, M_REC, M_HIST };
+       WM_HIST_END, WM_JOB_DONE, WM_JOB_ERROR, WM_REC_LOCK, WM_DICT_OPEN };
+enum { T_REC = 1, T_TAIL, T_PASTE, T_RESTORE, T_MSG, T_TRIM, T_DICTFOCUS };
+/* M_REC: Ctrl+Win held while recording. M_LOCKED: hands-free recording after a quick tap. */
+enum { M_IDLE, M_REC, M_HIST, M_LOCKED };
 enum { ID_HISTORY = 100, ID_SETTINGS, ID_PROMPT, ID_DICT, ID_AUTOSTART, ID_EXIT };
 
 static const char DEFAULT_PROMPT[] =
@@ -122,6 +124,11 @@ static const char DEFAULT_CONFIG[] =
 "; Replaces {{agentName}} in prompt.txt\r\n"
 "agent_name=LocalWispr\r\n"
 "\r\n"
+"[hotkey]\r\n"
+"; Hold Left Ctrl+Win to dictate. A tap shorter than this (ms) starts hands-free recording;\r\n"
+"; tap Ctrl+Win again to finish.\r\n"
+"tap_ms=350\r\n"
+"\r\n"
 "[dictionary]\r\n"
 "; Words live in dictionary.txt. 1 = learn words you correct within 30 s of a paste.\r\n"
 "auto_learn=1\r\n";
@@ -137,6 +144,7 @@ static HINSTANCE g_inst;
 static HWND g_main, g_overlay, g_histwnd;
 static DWORD g_hookTid;
 static volatile LONG g_mode = M_IDLE;
+static volatile LONG g_tapMs = TAP_MS_DEFAULT;   /* read by the hook thread */
 static UINT WM_TASKBARCREATED;
 static wchar_t g_dir[MAX_PATH], g_cfgPath[MAX_PATH], g_promptPath[MAX_PATH], g_histPath[MAX_PATH], g_dictPath[MAX_PATH];
 static float g_s = 1.0f;                       /* DPI scale */
@@ -153,7 +161,8 @@ static void dbg(const char *fmt, ...)
     char b[512];
     va_list a;
     va_start(a, fmt);
-    int n = vsnprintf(b, sizeof b - 2, fmt, a);
+    int n0 = snprintf(b, 16, "%06llu ", (unsigned long long)(GetTickCount64() % 1000000));
+    int n = n0 + vsnprintf(b + n0, sizeof b - 2 - n0, fmt, a);
     va_end(a);
     if (n < 0) return;
     if (n > (int)sizeof b - 3) n = sizeof b - 3;
@@ -390,42 +399,130 @@ static char *load_prompt(const char *agent)
 
 /* -------------------------------------------------------------- dictionary */
 
-/* dictionary.txt entries joined with ", ". With maxChars, only the newest entries
-   that fit are kept (learned words are appended, so newest = last). NULL if empty. */
-static char *dict_joined(size_t maxChars)
+/* dictionary.txt: one entry per line, lines starting with # are comments, and an entry
+   may end with "  # learned" (added automatically when a correction is learned). */
+typedef struct { char **w; unsigned char *learned; int n; char *buf; } DictList;
+
+static int dict_parse_line(char *p, int *learned)
 {
-    char *raw = read_file(g_dictPath, NULL);
-    if (!raw) return NULL;
-    static char *items[4096];
-    int n = 0;
-    char *p = raw;
+    trim_inplace(p);
+    *learned = 0;
+    if (!*p || *p == '#') return 0;
+    char *hash = strstr(p, " #");
+    if (hash) {
+        *learned = strstr(hash, "learned") != NULL;
+        *hash = 0;
+        trim_inplace(p);
+    }
+    return *p != 0;
+}
+
+static void dict_load(DictList *d)
+{
+    memset(d, 0, sizeof *d);
+    d->buf = read_file(g_dictPath, NULL);
+    if (!d->buf) return;
+    int cap = 0;
+    char *p = d->buf;
     if (!strncmp(p, "\xEF\xBB\xBF", 3)) p += 3;
-    while (*p && n < 4096) {
+    while (*p) {
         char *nl = strchr(p, '\n');
         if (nl) *nl = 0;
-        trim_inplace(p);
-        if (*p && *p != '#') items[n++] = p;
+        int learned;
+        if (dict_parse_line(p, &learned)) {
+            if (d->n == cap) {
+                cap = cap ? cap * 2 : 64;
+                d->w = (char **)realloc(d->w, cap * sizeof(char *));
+                d->learned = (unsigned char *)realloc(d->learned, cap);
+            }
+            d->w[d->n] = p;
+            d->learned[d->n] = (unsigned char)learned;
+            d->n++;
+        }
         if (!nl) break;
         p = nl + 1;
     }
+}
+
+static void dict_free(DictList *d)
+{
+    free(d->w);
+    free(d->learned);
+    free(d->buf);
+    memset(d, 0, sizeof *d);
+}
+
+static int dict_find(const DictList *d, const char *w)
+{
+    for (int i = 0; i < d->n; i++)
+        if (!_stricmp(d->w[i], w)) return i;
+    return -1;
+}
+
+/* Entries joined with ", ". With maxChars, only the newest entries that fit are kept
+   (new words are appended, so newest = last). NULL if empty. */
+static char *dict_joined(size_t maxChars)
+{
+    DictList d;
+    dict_load(&d);
     int first = 0;
     if (maxChars) {
         size_t total = 0;
-        for (first = n; first > 0; first--) {
-            size_t add = strlen(items[first - 1]) + 2;
+        for (first = d.n; first > 0; first--) {
+            size_t add = strlen(d.w[first - 1]) + 2;
             if (total + add > maxChars) break;
             total += add;
         }
     }
     Sb s = {0};
-    for (int i = first; i < n; i++) {
+    for (int i = first; i < d.n; i++) {
         if (s.n) sb_str(&s, ", ");
-        sb_str(&s, items[i]);
+        sb_str(&s, d.w[i]);
     }
-    free(raw);
+    dict_free(&d);
     return s.p;
 }
 
+static void dict_write_all(const char *data, size_t len)
+{
+    wchar_t tmp[MAX_PATH];
+    _snwprintf(tmp, MAX_PATH - 1, L"%ls.tmp", g_dictPath);
+    tmp[MAX_PATH - 1] = 0;
+    HANDLE f = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD wr;
+    BOOL ok = WriteFile(f, data, (DWORD)len, &wr, NULL) && wr == len;
+    CloseHandle(f);
+    if (ok) MoveFileExW(tmp, g_dictPath, MOVEFILE_REPLACE_EXISTING);
+    else DeleteFileW(tmp);
+}
+
+/* Removes every line whose entry matches `word` (case-insensitive); comments are kept. */
+static int dict_remove(const char *word)
+{
+    char *raw = read_file(g_dictPath, NULL);
+    if (!raw) return 0;
+    Sb out = {0};
+    int removed = 0;
+    for (char *p = raw; *p;) {
+        char *nl = strchr(p, '\n');
+        size_t l = nl ? (size_t)(nl - p) + 1 : strlen(p);
+        char *line = (char *)malloc(l + 1);
+        memcpy(line, p, l);
+        line[l] = 0;
+        int learned;
+        char *probe = _strdup(line);
+        if (dict_parse_line(probe, &learned) && !_stricmp(probe, word)) removed++;
+        else sb_add(&out, line, l);
+        free(probe);
+        free(line);
+        p += l;
+    }
+    if (removed) dict_write_all(out.p ? out.p : "", out.n);
+    free(out.p);
+    free(raw);
+    return removed;
+}
 /* Lowercased words of s (letters/digits only; non-ASCII bytes count as letters), de-duplicated. */
 #define EW_MAX 400
 typedef struct { char w[EW_MAX][40]; int n; } Words;
@@ -474,39 +571,31 @@ static int is_dictionary_echo(const char *text, const char *prompt)
     return echo;
 }
 
-/* Appends words (newline separated, UTF-8) that aren't already in dictionary.txt.
-   Returns the ones actually added, comma separated (malloc'd), or NULL. */
-static char *dict_add_words(const char *list)
+/* Appends words (newline separated, UTF-8) that aren't already in dictionary.txt, tagging
+   them "# learned" when they came from a correction. Returns the ones added, comma
+   separated (malloc'd), or NULL. */
+static char *dict_add_words(const char *list, int learned)
 {
+    DictList d;
+    dict_load(&d);
     DWORD len = 0;
     char *raw = read_file(g_dictPath, &len);
     Sb add = {0}, shown = {0};
     char *copy = _strdup(list);
     for (char *w = strtok(copy, "\n"); w; w = strtok(NULL, "\n")) {
-        trim_inplace(w);
-        if (!*w) continue;
-        int have = 0;
-        if (raw) {
-            for (char *p = raw; *p && !have;) {
-                char *nl = strchr(p, '\n');
-                size_t l = nl ? (size_t)(nl - p) : strlen(p);
-                while (l && (p[l - 1] == '\r' || p[l - 1] == ' ')) l--;
-                have = l == strlen(w) && !_strnicmp(p, w, l);
-                p = nl ? nl + 1 : p + strlen(p);
-            }
+        int dummy;
+        if (!dict_parse_line(w, &dummy) || strlen(w) > 100) continue;
+        if (dict_find(&d, w) >= 0) continue;
+        int dup = 0;   /* repeats within this batch */
+        for (char *q = shown.p; q && *q && !dup;) {
+            char *comma = strstr(q, ", ");
+            size_t l = comma ? (size_t)(comma - q) : strlen(q);
+            dup = l == strlen(w) && !_strnicmp(q, w, l);
+            q = comma ? comma + 2 : q + l;
         }
-        if (!have && shown.p) {   /* also skip duplicates within this batch */
-            Sb probe = {0};
-            sb_str(&probe, ", "); sb_str(&probe, shown.p); sb_str(&probe, ", ");
-            Sb needle = {0};
-            sb_str(&needle, ", "); sb_str(&needle, w); sb_str(&needle, ", ");
-            have = strstr(probe.p, needle.p) != NULL;
-            free(probe.p);
-            free(needle.p);
-        }
-        if (have) continue;
+        if (dup) continue;
         sb_str(&add, w);
-        sb_str(&add, "\r\n");
+        sb_str(&add, learned ? "  # learned\r\n" : "\r\n");
         if (shown.n) sb_str(&shown, ", ");
         sb_str(&shown, w);
     }
@@ -515,16 +604,16 @@ static char *dict_add_words(const char *list)
         HANDLE f = CreateFileW(g_dictPath, FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, 0, NULL);
         if (f != INVALID_HANDLE_VALUE) {
             DWORD wr;
-            if (len && raw[len - 1] != '\n') WriteFile(f, "\r\n", 2, &wr, NULL);
+            if (raw && len && raw[len - 1] != '\n') WriteFile(f, "\r\n", 2, &wr, NULL);
             WriteFile(f, add.p, (DWORD)add.n, &wr, NULL);
             CloseHandle(f);
         }
     }
     free(add.p);
     free(raw);
+    dict_free(&d);
     return shown.p;
 }
-
 /* -------------------------------------------------------------- OpenAI API */
 
 static void set_err(wchar_t *err, const wchar_t *what, DWORD status, const char *detail)
@@ -1424,9 +1513,35 @@ static void send_ctrl_v(void)
 
 static void paste_now(const char *text)
 {
+#ifdef LW_TEST   /* test builds only paste into the harness (LW_PASTE_PID), never into your other windows */
+    {
+        char want[16];
+        DWORD pid = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+        if (GetEnvironmentVariableA("LW_PASTE_PID", want, sizeof want) && pid != (DWORD)atoi(want)) {
+            dbg("paste: refused, foreground pid %lu is not the harness", (unsigned long)pid);
+            return;
+        }
+    }
+#endif
     if (!g_snap.valid) snap_take();          /* keep the user's original across back-to-back pastes */
-    if (!clip_set_text(text, 1)) return;
+    if (!clip_set_text(text, 1)) { dbg("paste: clipboard busy"); return; }
     g_snap.seq = GetClipboardSequenceNumber();
+#ifdef LW_TEST
+    {
+        wchar_t cls[64] = L"";
+        HWND fg = GetForegroundWindow();
+        GetClassNameW(fg, cls, 64);
+        GUITHREADINFO gi = {sizeof gi};
+        GetGUIThreadInfo(GetWindowThreadProcessId(fg, NULL), &gi);
+        wchar_t fcls[64] = L"";
+        if (gi.hwndFocus) GetClassNameW(gi.hwndFocus, fcls, 64);
+        char a[64], b[64];
+        WideCharToMultiByte(CP_UTF8, 0, cls, -1, a, 64, NULL, NULL);
+        WideCharToMultiByte(CP_UTF8, 0, fcls, -1, b, 64, NULL, NULL);
+        dbg("paste: fg=%s focus=%s", a, b);
+    }
+#endif
     send_ctrl_v();
     SetTimer(g_main, T_RESTORE, RESTORE_MS, NULL);
     watch_start(text);
@@ -1436,8 +1551,9 @@ static void paste_pump(void)
 {
     while (g_pasteN) {
         /* Wait until the user has let go of every modifier, otherwise Ctrl+V becomes Win+Ctrl+V etc. */
-        int busy = g_mode != M_IDLE || down(VK_LWIN) || down(VK_RWIN) || down(VK_CONTROL) ||
+        int busy = g_mode == M_REC || g_mode == M_HIST || down(VK_LWIN) || down(VK_RWIN) || down(VK_CONTROL) ||
                    down(VK_MENU) || down(VK_SHIFT);
+        if (busy) dbg("paste wait: mode=%d lwin=%d ctrl=%d alt=%d shift=%d", (int)g_mode, down(VK_LWIN), down(VK_CONTROL), down(VK_MENU), down(VK_SHIFT));
         if (busy && now_ms() - g_pasteSince < 4000) {
             SetTimer(g_main, T_PASTE, 30, NULL);
             return;
@@ -1463,6 +1579,7 @@ static void paste_enqueue(char *text)
 
 static wchar_t g_msg[128];
 static ULONGLONG g_msgUntil;
+static int g_locked;             /* current recording is hands-free */
 
 typedef struct {
     HWAVEIN h;
@@ -1486,6 +1603,14 @@ static void place_bottom_center(HWND w, int cw, int ch, int lift)
     SetWindowPos(w, HWND_TOPMOST, x, y, cw, ch, SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
+static const wchar_t *overlay_label(COLORREF *dot)
+{
+    if (R.h) { *dot = RGB(239, 68, 68); return g_locked ? L"Hands-free \x00B7 tap Ctrl+Win to finish" : L"Listening"; }
+    if (now_ms() < g_msgUntil) { *dot = RGB(34, 197, 94); return g_msg; }
+    *dot = RGB(245, 158, 11);
+    return L"Transcribing\x2026";
+}
+
 static void overlay_refresh(void)
 {
     HICON ico = R.h ? g_icoRec : (g_jobs ? g_icoBusy : g_icoIdle);
@@ -1493,11 +1618,14 @@ static void overlay_refresh(void)
     int show = R.h || g_jobs || now_ms() < g_msgUntil;
     if (!show) { ShowWindow(g_overlay, SW_HIDE); return; }
     int w = (int)(200 * g_s), h = (int)(40 * g_s);
-    if (!R.h && now_ms() < g_msgUntil) {     /* size the pill to fit a longer message */
+    {   /* size the pill to fit the label (plus the level meter while recording) */
+        COLORREF dot;
+        const wchar_t *label = overlay_label(&dot);
         HDC dc = GetDC(g_overlay);
         HGDIOBJ of = SelectObject(dc, g_fontBold);
         SIZE sz;
-        if (GetTextExtentPoint32W(dc, g_msg, (int)wcslen(g_msg), &sz)) w = max(w, sz.cx + (int)(50 * g_s));
+        if (GetTextExtentPoint32W(dc, label, (int)wcslen(label), &sz))
+            w = max(w, sz.cx + (int)((R.h ? 90 : 50) * g_s));
         SelectObject(dc, of);
         ReleaseDC(g_overlay, dc);
     }
@@ -1547,17 +1675,14 @@ static void overlay_paint(HWND w)
     DeleteObject(bg);
 
     COLORREF dot;
-    const wchar_t *label;
-    if (R.h) { dot = RGB(239, 68, 68); label = L"Listening"; }
-    else if (now_ms() < g_msgUntil) { dot = RGB(34, 197, 94); label = g_msg; }
-    else { dot = RGB(245, 158, 11); label = L"Transcribing\x2026"; }
+    const wchar_t *label = overlay_label(&dot);
 
     int cy = rc.bottom / 2, r = (int)(5 * g_s), x0 = (int)(18 * g_s);
     fill_round(dc, x0 - r, cy - r, x0 + r + 1, cy + r + 1, 0, dot);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(240, 240, 240));
     HGDIOBJ of = SelectObject(dc, g_fontBold);
-    RECT tr = {(int)(32 * g_s), 0, rc.right - (int)(14 * g_s), rc.bottom};
+    RECT tr = {(int)(32 * g_s), 0, rc.right - (int)((R.h ? 50 : 14) * g_s), rc.bottom};
     DrawTextW(dc, label, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
     SelectObject(dc, of);
 
@@ -1618,7 +1743,7 @@ static void hist_paint(HWND w)
     DrawTextW(dc, L"Dictation history", -1, &hr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
     SelectObject(dc, g_fontSmall);
     SetTextColor(dc, RGB(150, 150, 160));
-    DrawTextW(dc, L"\x2191 \x2193 select   release to copy   Esc cancel", -1, &hr, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
+    DrawTextW(dc, L"\x2191\x2193 select   release to copy   \x2192 dictionary   Esc cancel", -1, &hr, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
 
     if (!g_histCount) {
         RECT er = {pad, headH, rc.right - pad, rc.bottom - pad};
@@ -1700,6 +1825,270 @@ static void hist_end(int commit)
     SetTimer(g_main, T_TRIM, 1500, NULL);
 }
 
+/* ------------------------------------------------------- dictionary window */
+/*
+ * Opened with Right arrow in the Ctrl+Win+Alt popup (or from the tray). Unlike the
+ * popup it is a normal window that stays open: type + Enter adds, Up/Down picks,
+ * Delete removes, Esc closes. It is destroyed on close so it costs nothing after.
+ */
+
+enum { IDC_DEDIT = 201, IDC_DLIST, IDC_DOPEN };
+static HWND g_dictWnd, g_dictEdit, g_dictList, g_dictBtn;
+static WNDPROC g_dictEditProc0;
+static HBRUSH g_dictBg, g_dictEditBg;
+static ULONGLONG g_dictFocusSince;
+
+static void dict_reload(const wchar_t *select, int fallbackIndex)
+{
+    if (!g_dictList) return;
+    SendMessageW(g_dictList, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(g_dictList, LB_RESETCONTENT, 0, 0);
+    DictList d;
+    dict_load(&d);
+    int sel = -1;
+    for (int i = d.n - 1; i >= 0; i--) {                 /* newest first */
+        wchar_t *w = to_wide(d.w[i]);
+        LRESULT idx = SendMessageW(g_dictList, LB_ADDSTRING, 0, (LPARAM)w);
+        SendMessageW(g_dictList, LB_SETITEMDATA, idx, d.learned[i]);
+        if (select && sel < 0 && CompareStringOrdinal(w, -1, select, -1, TRUE) == CSTR_EQUAL) sel = (int)idx;
+        free(w);
+    }
+    dict_free(&d);
+    int count = (int)SendMessageW(g_dictList, LB_GETCOUNT, 0, 0);
+    if (sel < 0) sel = fallbackIndex < count ? fallbackIndex : count - 1;
+    if (sel >= 0) SendMessageW(g_dictList, LB_SETCURSEL, sel, 0);
+    SendMessageW(g_dictList, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_dictList, NULL, TRUE);
+    InvalidateRect(g_dictWnd, NULL, FALSE);
+}
+
+static void dict_delete_selected(void)
+{
+    int sel = (int)SendMessageW(g_dictList, LB_GETCURSEL, 0, 0);
+    if (sel < 0) return;
+    wchar_t w[256];
+    if (SendMessageW(g_dictList, LB_GETTEXTLEN, sel, 0) >= 255) return;
+    SendMessageW(g_dictList, LB_GETTEXT, sel, (LPARAM)w);
+    char u[768];
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof u, NULL, NULL);
+    if (dict_remove(u)) dict_reload(NULL, sel);
+}
+
+static void dict_add_from_edit(void)
+{
+    wchar_t w[256];
+    GetWindowTextW(g_dictEdit, w, 256);
+    char u[768];
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof u, NULL, NULL);
+    trim_inplace(u);
+    if (!u[0]) return;
+    free(dict_add_words(u, 0));
+    SetWindowTextW(g_dictEdit, L"");
+    wchar_t *sel = to_wide(u);
+    dict_reload(sel, 0);
+    free(sel);
+}
+
+static LRESULT CALLBACK dict_edit_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
+{
+    if (m == WM_KEYDOWN) {
+        switch (wp) {
+        case VK_RETURN: dict_add_from_edit(); return 0;
+        case VK_ESCAPE: DestroyWindow(g_dictWnd); return 0;
+        case VK_UP: case VK_DOWN: case VK_PRIOR: case VK_NEXT:
+            SendMessageW(g_dictList, WM_KEYDOWN, wp, lp);   /* arrows move the list selection */
+            return 0;
+        case VK_DELETE:
+            if (!GetWindowTextLengthW(w)) { dict_delete_selected(); return 0; }
+            break;
+        }
+    } else if (m == WM_CHAR && (wp == '\r' || wp == 27)) {
+        return 0;                                            /* no beep */
+    }
+    return CallWindowProcW(g_dictEditProc0, w, m, wp, lp);
+}
+
+static void dict_layout(HWND w)
+{
+    RECT rc;
+    GetClientRect(w, &rc);
+    int pad = (int)(14 * g_s), lab = (int)(22 * g_s), eh = (int)(30 * g_s), foot = (int)(44 * g_s);
+    MoveWindow(g_dictEdit, pad, pad + lab, rc.right - 2 * pad, eh, TRUE);
+    int ly = pad + lab + eh + (int)(10 * g_s);
+    MoveWindow(g_dictList, pad, ly, rc.right - 2 * pad, rc.bottom - ly - foot, TRUE);
+    int bw = (int)(96 * g_s), bh = (int)(28 * g_s);
+    MoveWindow(g_dictBtn, rc.right - pad - bw, rc.bottom - foot + (foot - bh) / 2, bw, bh, TRUE);
+}
+
+static LRESULT CALLBACK dict_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
+{
+    switch (m) {
+    case WM_CREATE: {
+        g_dictBg = CreateSolidBrush(RGB(28, 28, 32));
+        g_dictEditBg = CreateSolidBrush(RGB(44, 44, 50));
+        g_dictEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                     0, 0, 10, 10, w, (HMENU)(INT_PTR)IDC_DEDIT, g_inst, NULL);
+        g_dictList = CreateWindowExW(0, L"LISTBOX", L"",
+                                     WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY | LBS_HASSTRINGS |
+                                     LBS_OWNERDRAWFIXED | LBS_NOINTEGRALHEIGHT | LBS_WANTKEYBOARDINPUT,
+                                     0, 0, 10, 10, w, (HMENU)(INT_PTR)IDC_DLIST, g_inst, NULL);
+        g_dictBtn = CreateWindowExW(0, L"BUTTON", L"Open file", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                                    0, 0, 10, 10, w, (HMENU)(INT_PTR)IDC_DOPEN, g_inst, NULL);
+        SendMessageW(g_dictEdit, WM_SETFONT, (WPARAM)g_fontText, FALSE);
+        SendMessageW(g_dictEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM((int)(8 * g_s), (int)(8 * g_s)));
+        SendMessageW(g_dictEdit, EM_SETLIMITTEXT, 100, 0);
+        g_dictEditProc0 = (WNDPROC)SetWindowLongPtrW(g_dictEdit, GWLP_WNDPROC, (LONG_PTR)dict_edit_proc);
+        HMODULE ux = LoadLibraryW(L"uxtheme.dll");           /* dark scrollbar, if available */
+        typedef HRESULT (WINAPI *SetTheme)(HWND, LPCWSTR, LPCWSTR);
+        SetTheme st = ux ? (SetTheme)(void *)GetProcAddress(ux, "SetWindowTheme") : NULL;
+        if (st) st(g_dictList, L"DarkMode_Explorer", NULL);
+        BOOL dark = TRUE;
+        DwmSetWindowAttribute(w, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof dark);
+        dict_layout(w);
+        dict_reload(NULL, 0);
+        return 0;
+    }
+    case WM_SIZE: dict_layout(w); return 0;
+    case WM_ACTIVATE:
+        if (LOWORD(wp) != WA_INACTIVE) {
+            int sel = (int)SendMessageW(g_dictList, LB_GETCURSEL, 0, 0);
+            dict_reload(NULL, sel < 0 ? 0 : sel);           /* pick up edits made in Notepad */
+            SetFocus(g_dictEdit);
+            return 0;
+        }
+        break;
+    case WM_MEASUREITEM: ((MEASUREITEMSTRUCT *)lp)->itemHeight = (UINT)(30 * g_s); return TRUE;
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT *)lp;
+        HDC dc = di->hDC;
+        RECT r = di->rcItem;
+        SetBkMode(dc, TRANSPARENT);
+        if (di->CtlID == IDC_DOPEN) {
+            FillRect(dc, &r, g_dictBg);
+            fill_round(dc, r.left, r.top, r.right, r.bottom, (int)(10 * g_s),
+                       (di->itemState & ODS_SELECTED) ? RGB(70, 70, 80) : RGB(52, 52, 60));
+            SetTextColor(dc, RGB(235, 235, 240));
+            HGDIOBJ of = SelectObject(dc, g_fontSmall);
+            DrawTextW(dc, L"Open file", -1, &r, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+            SelectObject(dc, of);
+            return TRUE;
+        }
+        if (di->itemID == (UINT)-1) { FillRect(dc, &r, g_dictBg); return TRUE; }
+        int selected = (di->itemState & ODS_SELECTED) != 0;
+        FillRect(dc, &r, g_dictBg);
+        if (selected) fill_round(dc, r.left + 1, r.top + 1, r.right - 1, r.bottom - 1, (int)(10 * g_s), RGB(37, 99, 235));
+        wchar_t t[256];
+        if (SendMessageW(g_dictList, LB_GETTEXTLEN, di->itemID, 0) < 255) SendMessageW(g_dictList, LB_GETTEXT, di->itemID, (LPARAM)t);
+        else t[0] = 0;
+        RECT tr = {r.left + (int)(10 * g_s), r.top, r.right - (int)(80 * g_s), r.bottom};
+        HGDIOBJ of = SelectObject(dc, g_fontText);
+        SetTextColor(dc, RGB(245, 245, 245));
+        DrawTextW(dc, t, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+        if (di->itemData) {
+            RECT lr = {r.right - (int)(80 * g_s), r.top, r.right - (int)(10 * g_s), r.bottom};
+            SelectObject(dc, g_fontSmall);
+            SetTextColor(dc, selected ? RGB(215, 228, 255) : RGB(125, 125, 135));
+            DrawTextW(dc, L"learned", -1, &lr, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
+        }
+        SelectObject(dc, of);
+        return TRUE;
+    }
+    case WM_VKEYTOITEM:
+        if (LOWORD(wp) == VK_DELETE) { dict_delete_selected(); return -2; }
+        if (LOWORD(wp) == VK_ESCAPE) { DestroyWindow(w); return -2; }
+        return -1;
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDC_DOPEN) open_in_notepad(g_dictPath);
+        return 0;
+    case WM_CTLCOLOREDIT:
+        SetTextColor((HDC)wp, RGB(245, 245, 245));
+        SetBkColor((HDC)wp, RGB(44, 44, 50));
+        return (LRESULT)g_dictEditBg;
+    case WM_CTLCOLORLISTBOX:
+        return (LRESULT)g_dictBg;
+    case WM_ERASEBKGND: {
+        RECT rc;
+        GetClientRect(w, &rc);
+        FillRect((HDC)wp, &rc, g_dictBg);
+        return 1;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(w, &ps);
+        RECT rc;
+        GetClientRect(w, &rc);
+        int pad = (int)(14 * g_s), foot = (int)(44 * g_s);
+        SetBkMode(dc, TRANSPARENT);
+        HGDIOBJ of = SelectObject(dc, g_fontSmall);
+        SetTextColor(dc, RGB(150, 150, 160));
+        RECT lr = {pad, pad, rc.right - pad, pad + (int)(20 * g_s)};
+        DrawTextW(dc, L"Type a word or name and press Enter to add it", -1, &lr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+        int count = g_dictList ? (int)SendMessageW(g_dictList, LB_GETCOUNT, 0, 0) : 0;
+        wchar_t hint[96];
+        _snwprintf(hint, 95, L"%d words   \x2191\x2193 select   Del remove   Esc close", count);
+        hint[95] = 0;
+        RECT fr = {pad, rc.bottom - foot, rc.right - pad - (int)(104 * g_s), rc.bottom};
+        DrawTextW(dc, hint, -1, &fr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
+        SelectObject(dc, of);
+        EndPaint(w, &ps);
+        return 0;
+    }
+    case WM_DESTROY:
+        DeleteObject(g_dictBg);
+        DeleteObject(g_dictEditBg);
+        g_dictWnd = g_dictEdit = g_dictList = g_dictBtn = NULL;
+        KillTimer(g_main, T_DICTFOCUS);
+        SetTimer(g_main, T_TRIM, 1500, NULL);
+        return 0;
+    }
+    return DefWindowProcW(w, m, wp, lp);
+}
+
+static void force_foreground(HWND h)
+{
+    HWND fg = GetForegroundWindow();
+    DWORD ft = fg ? GetWindowThreadProcessId(fg, NULL) : 0, me = GetCurrentThreadId();
+    if (ft && ft != me) AttachThreadInput(me, ft, TRUE);
+    ShowWindow(h, SW_SHOWNORMAL);
+    BringWindowToTop(h);
+    SetForegroundWindow(h);
+    if (ft && ft != me) AttachThreadInput(me, ft, FALSE);
+}
+
+/* Focus the window once Ctrl/Win/Alt are released, so their key-ups don't land in it. */
+static void dict_focus_tick(void)
+{
+    if (!g_dictWnd) { KillTimer(g_main, T_DICTFOCUS); return; }
+    int held = down(VK_CONTROL) || down(VK_LWIN) || down(VK_RWIN) || down(VK_MENU) || down(VK_SHIFT);
+    if (held && now_ms() - g_dictFocusSince < 5000) return;
+    KillTimer(g_main, T_DICTFOCUS);
+    force_foreground(g_dictWnd);
+    SetFocus(g_dictEdit);
+}
+
+static void dict_open(void)
+{
+    if (!g_dictWnd) {
+        RECT r = {0, 0, (int)(420 * g_s), (int)(520 * g_s)};
+        DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME;
+        AdjustWindowRectEx(&r, style, FALSE, 0);
+        int w = r.right - r.left, h = r.bottom - r.top;
+        POINT pt;
+        GetCursorPos(&pt);
+        MONITORINFO mi = {sizeof mi};
+        GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY), &mi);
+        RECT wa = mi.rcWork;
+        g_dictWnd = CreateWindowExW(0, L"LocalWisprDict", L"LocalWispr dictionary", style,
+                                    (wa.left + wa.right - w) / 2, (wa.top + wa.bottom - h) / 2, w, h,
+                                    NULL, NULL, g_inst, NULL);
+        if (!g_dictWnd) return;
+        ShowWindow(g_dictWnd, SW_SHOWNOACTIVATE);
+    }
+    g_dictFocusSince = now_ms();
+    SetTimer(g_main, T_DICTFOCUS, 30, NULL);
+    dict_focus_tick();
+}
+
 /* -------------------------------------------------------------- recording */
 
 static void harvest(int requeue)
@@ -1753,6 +2142,7 @@ static void rec_finish(int submit)
     KillTimer(g_main, T_REC);
     KillTimer(g_main, T_TAIL);
     R.tail = 0;
+    g_locked = 0;
     if (!R.h) return;
     waveInStop(R.h);
     waveInReset(R.h);
@@ -1788,6 +2178,8 @@ static void rec_start(void)
 {
     if (R.tail) rec_finish(1);
     if (R.h) return;
+    g_locked = 0;
+    InterlockedExchange(&g_tapMs, (LONG)GetPrivateProfileIntW(L"hotkey", L"tap_ms", TAP_MS_DEFAULT, g_cfgPath));
     WAVEFORMATEX wf = {WAVE_FORMAT_PCM, 1, SAMPLE_RATE, BYTES_PER_SEC, 2, 16, 0};
     R.t0 = now_ms();
     R.tFirst = 0;
@@ -1842,6 +2234,8 @@ static void rec_tick(void)
 /* ---------------------------------------------------------- keyboard hook */
 
 static BYTE g_keyDown[256], g_swallowed[256];
+static DWORD g_chordTime;        /* when Ctrl+Win went down (hook clock) */
+static int g_chordWasLocked;     /* this hold is the tap that ends a hands-free recording */
 
 static void send_mask_key(void)
 {
@@ -1869,6 +2263,10 @@ static LRESULT CALLBACK ll_proc(int code, WPARAM wp, LPARAM lp)
     int isAlt = vk == VK_LMENU || vk == VK_RMENU;
     int isMod = isCtrl || isWin || isAlt || vk == VK_RCONTROL || vk == VK_LSHIFT || vk == VK_RSHIFT;
     LONG mode = g_mode;
+#ifdef LW_TEST
+    if (isCtrl || isWin || isAlt || mode != M_IDLE)
+        dbg("hook %s vk=%02x mode=%d", isDown ? "down" : "up  ", (unsigned)vk, (int)mode);
+#endif
 
     if (isDown) {
         int wasDown = g_keyDown[vk];
@@ -1880,21 +2278,52 @@ static LRESULT CALLBACK ll_proc(int code, WPARAM wp, LPARAM lp)
                 int a = isAlt || down(VK_MENU);
                 if (c && w) {
                     send_mask_key();
+                    g_chordTime = k->time;
+                    g_chordWasLocked = 0;
                     InterlockedExchange(&g_mode, a ? M_HIST : M_REC);
                     PostMessageW(g_main, a ? WM_HIST_SHOW : WM_REC_START, 0, 0);
                 }
             }
+        } else if (mode == M_LOCKED) {
+            /* Hands-free: everything passes through except Ctrl+Win, which starts the finishing tap. */
+            if (!wasDown && (isCtrl || isWin || isAlt)) {
+                int c = isCtrl || down(VK_LCONTROL);
+                int w = isWin || down(VK_LWIN) || down(VK_RWIN);
+                int a = isAlt || down(VK_MENU);
+                if (c && w) {
+                    send_mask_key();
+                    if (a) {                         /* Ctrl+Win+Alt: discard, show history */
+                        InterlockedExchange(&g_mode, M_HIST);
+                        PostMessageW(g_main, WM_REC_STOP, 0, 0);
+                        PostMessageW(g_main, WM_HIST_SHOW, 0, 0);
+                    } else {
+                        g_chordTime = k->time;
+                        g_chordWasLocked = 1;
+                        InterlockedExchange(&g_mode, M_REC);
+                    }
+                }
+            }
         } else if (mode == M_REC) {
-            if (isAlt && !wasDown) {                 /* Ctrl+Win -> +Alt: switch to history */
+            if (isAlt && !wasDown) {                 /* Ctrl+Win -> +Alt: discard, show history */
                 send_mask_key();
                 InterlockedExchange(&g_mode, M_HIST);
                 PostMessageW(g_main, WM_REC_STOP, 0, 0);
                 PostMessageW(g_main, WM_HIST_SHOW, 0, 0);
             } else if (!isMod) {                     /* Ctrl+Win+<key> is some other shortcut */
-                InterlockedExchange(&g_mode, M_IDLE);
-                PostMessageW(g_main, WM_REC_STOP, 0, 0);
+                if (g_chordWasLocked) {
+                    InterlockedExchange(&g_mode, M_LOCKED);   /* hands-free keeps going */
+                } else {
+                    InterlockedExchange(&g_mode, M_IDLE);
+                    PostMessageW(g_main, WM_REC_STOP, 0, 0);
+                }
             }
         } else if (mode == M_HIST) {
+            if (vk == VK_RIGHT) {                    /* open the dictionary window */
+                InterlockedExchange(&g_mode, M_IDLE);
+                PostMessageW(g_main, WM_DICT_OPEN, 0, 0);
+                g_swallowed[vk] = 1;
+                return 1;
+            }
             if (vk == VK_UP || vk == VK_DOWN) {
                 PostMessageW(g_main, WM_HIST_MOVE, vk == VK_UP ? (WPARAM)-1 : 1, 0);
                 g_swallowed[vk] = 1;
@@ -1911,8 +2340,13 @@ static LRESULT CALLBACK ll_proc(int code, WPARAM wp, LPARAM lp)
         g_keyDown[vk] = 0;
         if (g_swallowed[vk]) { g_swallowed[vk] = 0; return 1; }
         if (mode == M_REC && (isCtrl || isWin)) {
-            InterlockedExchange(&g_mode, M_IDLE);
-            PostMessageW(g_main, WM_REC_STOP, 1, 0);
+            if (!g_chordWasLocked && k->time - g_chordTime < (DWORD)g_tapMs) {
+                InterlockedExchange(&g_mode, M_LOCKED);      /* quick tap: go hands-free */
+                PostMessageW(g_main, WM_REC_LOCK, 1, 0);
+            } else {
+                InterlockedExchange(&g_mode, M_IDLE);
+                PostMessageW(g_main, WM_REC_STOP, 1, 0);
+            }
         } else if (mode == M_HIST && (isCtrl || isWin || isAlt)) {
             InterlockedExchange(&g_mode, M_IDLE);
             PostMessageW(g_main, WM_HIST_END, 1, 0);
@@ -1962,7 +2396,7 @@ static void show_menu(void)
     }
     case ID_SETTINGS: open_in_notepad(g_cfgPath); break;
     case ID_PROMPT: open_in_notepad(g_promptPath); break;
-    case ID_DICT: open_in_notepad(g_dictPath); break;
+    case ID_DICT: dict_open(); break;
     case ID_AUTOSTART: autostart_set(!autostart_enabled()); break;
     case ID_EXIT: DestroyWindow(g_main); break;
     }
@@ -1976,6 +2410,11 @@ static LRESULT CALLBACK main_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_LBUTTONUP) show_menu();
         return 0;
     case WM_REC_START: dbg("WM_REC_START"); rec_start(); return 0;
+    case WM_REC_LOCK:
+        dbg("WM_REC_LOCK h=%p", (void *)R.h);
+        if (R.h) { g_locked = 1; overlay_refresh(); }
+        else InterlockedExchange(&g_mode, M_IDLE);   /* mic failed to open: nothing to keep going */
+        return 0;
     case WM_REC_STOP:
         dbg("WM_REC_STOP wp=%d h=%p tail=%d", (int)wp, (void *)R.h, R.tail);
         if (wp && R.h && !R.tail) { R.tail = 1; SetTimer(w, T_TAIL, TAIL_MS, NULL); }
@@ -1991,15 +2430,21 @@ static LRESULT CALLBACK main_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_HIST_END: hist_end((int)wp); return 0;
+    case WM_DICT_OPEN:
+        ShowWindow(g_histwnd, SW_HIDE);
+        hist_free_wide();
+        dict_open();
+        return 0;
     case WM_COPYDATA: {
         COPYDATASTRUCT *cd = (COPYDATASTRUCT *)lp;
         if (!cd || cd->dwData != LW_COPYDATA_LEARNED || !cd->cbData || cd->cbData > 65536) return FALSE;
         char *list = (char *)malloc(cd->cbData + 1);
         memcpy(list, cd->lpData, cd->cbData);
         list[cd->cbData] = 0;
-        char *added = dict_add_words(list);
+        char *added = dict_add_words(list, 1);
         free(list);
         if (added) {
+            if (g_dictWnd) dict_reload(NULL, 0);
             wchar_t *wa = to_wide(added), m[128];
             _snwprintf(m, 127, L"Added to dictionary: %ls", wa);
             m[127] = 0;
@@ -2030,9 +2475,10 @@ static LRESULT CALLBACK main_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         case T_PASTE: paste_pump(); break;
         case T_RESTORE: KillTimer(w, T_RESTORE); snap_restore(); SetTimer(w, T_TRIM, 1000, NULL); break;
         case T_MSG: KillTimer(w, T_MSG); overlay_refresh(); break;
+        case T_DICTFOCUS: dict_focus_tick(); break;
         case T_TRIM:
             KillTimer(w, T_TRIM);
-            if (!R.h && !g_jobs && !g_snap.valid) trim_memory();
+            if (!R.h && !g_jobs && !g_snap.valid && !g_dictWnd) trim_memory();
             break;
         }
         return 0;
@@ -2211,6 +2657,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     RegisterClassW(&wc);
     wc.lpfnWndProc = hist_proc;
     wc.lpszClassName = L"LocalWisprHistory";
+    RegisterClassW(&wc);
+    wc.lpfnWndProc = dict_proc;
+    wc.lpszClassName = L"LocalWisprDict";
+    wc.hIcon = g_icoIdle;
     RegisterClassW(&wc);
 
     g_main = CreateWindowExW(0, L"LocalWisprMain", APP_NAME, WS_OVERLAPPED, 0, 0, 0, 0, NULL, NULL, inst, NULL);
