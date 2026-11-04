@@ -1,6 +1,6 @@
 <img src="assets/icon.svg" width="64" height="64" alt="">
 
-# LocalWispr
+# TinyWispr
 
 Push-to-talk dictation for Windows in one 110 KB native executable. It's a minimal take on
 [OpenWhispr](https://github.com/OpenWhispr/openwhispr) that does only the parts I use.
@@ -24,7 +24,7 @@ spelling hint and appended to the cleanup prompt ("use these exact spellings"). 
 transcriber only recites the list back (which can happen on near-silence), the result is thrown
 away.
 
-**Learning from your edits.** For 30 seconds after a paste, LocalWispr watches the text box it
+**Learning from your edits.** For 30 seconds after a paste, TinyWispr watches the text box it
 pasted into. If you fix a misheard word (say *Shunade* to *Sinead*), the corrected word is added
 to the dictionary and a pill says "Added to dictionary: Sinead". A word only counts as a fix if:
 
@@ -47,7 +47,7 @@ the dictionary window. It stays open after you let go:
 
 The window is destroyed when it closes. While open it adds about 0.5 MB.
 
-The watching runs in a short-lived child process (`localwispr.exe --watch`) that reads the field
+The watching runs in a short-lived child process (`tinywispr.exe --watch`) that reads the field
 through Windows UI Automation. It exits after 30 seconds, or as soon as you dictate again, so UI
 Automation is never loaded into the resident app. It can't read password fields or apps running
 as administrator, and it skips fields over 20,000 characters (whole documents).
@@ -83,12 +83,12 @@ Needs [Zig](https://ziglang.org) as the C compiler (`winget install zig.zig`).
 .\build.ps1 -Install
 ```
 
-This copies the exe to `%LOCALAPPDATA%\Programs\LocalWispr`, registers it to start at login, and
+This copies the exe to `%LOCALAPPDATA%\Programs\TinyWispr`, registers it to start at login, and
 launches it. The tray icon (blue = idle, red = recording, amber = transcribing) has the menu.
 
 ## Settings
 
-Everything lives in `%APPDATA%\LocalWispr`. Changes apply on the next dictation; no restart needed.
+Everything lives in `%APPDATA%\TinyWispr`. Changes apply on the next dictation; no restart needed.
 
 - `config.ini`: API key, models, language, `tap_ms`, and `auto_learn`. Set `[cleanup] enabled=0`
   to paste the raw transcript.
@@ -103,7 +103,7 @@ transcript is pasted and a tray notification says why.
 
 ## Testing
 
-`build.ps1 -Test` also builds `localwispr-test.exe`. That build accepts simulated key presses, and
-setting `LW_FAKE=<text>` skips OpenAI. `localwispr.exe --test in.wav out.txt` runs one 16 kHz mono
+`build.ps1 -Test` also builds `tinywispr-test.exe`. That build accepts simulated key presses, and
+setting `TW_FAKE=<text>` skips OpenAI. `tinywispr.exe --test in.wav out.txt` runs one 16 kHz mono
 WAV through the real pipeline and writes the raw transcript, the cleaned text and the timing.
-`localwispr-test.exe --unit out.txt` checks the correction learner and the echo filter.
+`tinywispr-test.exe --unit out.txt` checks the correction learner and the echo filter.

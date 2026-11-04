@@ -1,5 +1,5 @@
 /*
- * LocalWispr - tiny push-to-talk dictation for Windows.
+ * TinyWispr - tiny push-to-talk dictation for Windows.
  *
  *   Hold Left Ctrl + Win, talk, release  -> transcribe (OpenAI) -> clean up -> paste.
  *   Hold Left Ctrl + Win + Alt           -> last 5 dictations; Up/Down to pick,
@@ -31,7 +31,7 @@
 #include <stdarg.h>
 #include <uiautomation.h>
 
-#define APP_NAME      L"LocalWispr"
+#define APP_NAME      L"TinyWispr"
 #define SAMPLE_RATE   16000
 #define BYTES_PER_SEC (SAMPLE_RATE * 2)          /* 16-bit mono */
 #define NBUF          8
@@ -48,7 +48,7 @@
 #define WATCH_POLL_MS 250
 #define DICT_PROMPT_CHARS 800                    /* dictionary words sent to the transcriber */
 #define DICT_CLEANUP_CHARS 6000                  /* dictionary words sent to the cleanup model */
-#define LW_COPYDATA_LEARNED 0x4C57               /* WM_COPYDATA tag: watcher -> app */
+#define TW_COPYDATA_LEARNED 0x5457               /* WM_COPYDATA tag: watcher -> app */
 
 enum { WM_TRAY = WM_APP + 1, WM_REC_START, WM_REC_STOP, WM_HIST_SHOW, WM_HIST_MOVE,
        WM_HIST_END, WM_JOB_DONE, WM_JOB_ERROR, WM_REC_LOCK, WM_DICT_OPEN };
@@ -105,7 +105,7 @@ static const char DEFAULT_PROMPT[] =
 "OUTPUT: exactly the cleaned transcript and nothing else \xE2\x80\x94 no preamble, labels, quotes, tags, commentary, or answers. Empty or filler-only input \xE2\x86\x92 empty output.\n";
 
 static const char DEFAULT_CONFIG[] =
-"; LocalWispr settings. Changes apply on the next dictation; no restart needed.\r\n"
+"; TinyWispr settings. Changes apply on the next dictation; no restart needed.\r\n"
 "\r\n"
 "[openai]\r\n"
 "; Your OpenAI API key (or leave blank and set the OPENAI_API_KEY environment variable)\r\n"
@@ -122,7 +122,7 @@ static const char DEFAULT_CONFIG[] =
 "; Only for gpt-5.x models: none, low, medium (blank = model default)\r\n"
 "reasoning_effort=none\r\n"
 "; Replaces {{agentName}} in prompt.txt\r\n"
-"agent_name=LocalWispr\r\n"
+"agent_name=TinyWispr\r\n"
 "\r\n"
 "[hotkey]\r\n"
 "; Hold Left Ctrl+Win to dictate. A tap shorter than this (ms) starts hands-free recording;\r\n"
@@ -134,7 +134,7 @@ static const char DEFAULT_CONFIG[] =
 "auto_learn=1\r\n";
 
 static const char DEFAULT_DICTIONARY[] =
-"# LocalWispr dictionary: one word or name per line. Lines starting with # are ignored.\r\n"
+"# TinyWispr dictionary: one word or name per line. Lines starting with # are ignored.\r\n"
 "# These spellings go to the transcriber and the cleanup step.\r\n"
 "# When you fix a misheard word right after dictating, it is added here automatically.\r\n";
 
@@ -155,7 +155,7 @@ static int g_jobs;                             /* transcriptions in flight */
 
 static int down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
-#ifdef LW_TEST
+#ifdef TW_TEST
 static void dbg(const char *fmt, ...)
 {
     char b[512];
@@ -376,7 +376,7 @@ static void load_cfg(Cfg *c)
     c->cleanup = tmp[0] != '0';
     ini_get(L"cleanup", L"model", L"gpt-5.4-mini", c->cmodel, sizeof c->cmodel);
     ini_get(L"cleanup", L"reasoning_effort", L"", c->effort, sizeof c->effort);
-    ini_get(L"cleanup", L"agent_name", L"LocalWispr", c->agent, sizeof c->agent);
+    ini_get(L"cleanup", L"agent_name", L"TinyWispr", c->agent, sizeof c->agent);
 }
 
 static char *load_prompt(const char *agent)
@@ -674,10 +674,10 @@ typedef struct {
 
 static void run_job(Job *j)
 {
-#ifdef LW_TEST
-    { /* test builds: LW_FAKE=<text> skips the network */
+#ifdef TW_TEST
+    { /* test builds: TW_FAKE=<text> skips the network */
         static char fake[1024];
-        if (GetEnvironmentVariableA("LW_FAKE", fake, sizeof fake)) { j->text = _strdup(fake); return; }
+        if (GetEnvironmentVariableA("TW_FAKE", fake, sizeof fake)) { j->text = _strdup(fake); return; }
     }
 #endif
     Cfg c;
@@ -686,9 +686,9 @@ static void run_job(Job *j)
         wcscpy(j->err, L"No OpenAI API key. Right-click the tray icon > Edit settings.");
         return;
     }
-    HINTERNET ses = WinHttpOpen(L"LocalWispr/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    HINTERNET ses = WinHttpOpen(L"TinyWispr/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!ses) ses = WinHttpOpen(L"LocalWispr/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+    if (!ses) ses = WinHttpOpen(L"TinyWispr/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!ses) { wcscpy(j->err, L"Could not start WinHTTP"); return; }
     WinHttpSetTimeouts(ses, 10000, 10000, 60000, 90000);
@@ -697,7 +697,7 @@ static void run_job(Job *j)
     DWORD st;
 
     /* 1. Speech to text */
-    const char *b = "LocalWisprBoundary7f3a91c2";
+    const char *b = "TinyWisprBoundary7f3a91c2";
     Sb body = {0};
     mp_field(&body, b, "model", c.tmodel);
     mp_field(&body, b, "response_format", "json");
@@ -831,7 +831,7 @@ static void tray_add(void)
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
     g_nid.hIcon = g_icoShown ? g_icoShown : g_icoIdle;
-    wcscpy(g_nid.szTip, L"LocalWispr - hold Left Ctrl + Win to dictate");
+    wcscpy(g_nid.szTip, L"TinyWispr - hold Left Ctrl + Win to dictate");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
 
@@ -1303,7 +1303,7 @@ out:
     return found;
 }
 
-/* ---- watcher child process: localwispr.exe --watch <hwnd>, pasted text on stdin ---- */
+/* ---- watcher child process: tinywispr.exe --watch <hwnd>, pasted text on stdin ---- */
 
 typedef HRESULT (WINAPI *PFN_CoInitializeEx)(LPVOID, DWORD);
 typedef HRESULT (WINAPI *PFN_CoCreateInstance)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID *);
@@ -1339,7 +1339,7 @@ static wchar_t *field_read(FieldSrc *s)
 static void watch_send(HWND parent, Sb *words)
 {
     if (!words->n) return;
-    COPYDATASTRUCT cds = {LW_COPYDATA_LEARNED, (DWORD)words->n + 1, words->p};
+    COPYDATASTRUCT cds = {TW_COPYDATA_LEARNED, (DWORD)words->n + 1, words->p};
     SendMessageTimeoutW(parent, WM_COPYDATA, 0, (LPARAM)&cds, SMTO_ABORTIFHUNG, 3000, NULL);
 }
 
@@ -1397,7 +1397,7 @@ static int watch_main(HWND parent)
         }
         wchar_t *v = field_read(&src);
         ULONGLONG t = now_ms();
-#ifdef LW_TEST
+#ifdef TW_TEST
         if (v && wcscmp(v, last)) {
             char u[200];
             WideCharToMultiByte(CP_UTF8, 0, v, -1, u, sizeof u, NULL, NULL);
@@ -1498,12 +1498,12 @@ static char *g_pasteQ[16];
 static int g_pasteN;
 static ULONGLONG g_pasteSince;
 
-#define LW_INPUT_TAG ((ULONG_PTR)0x4C57495350ULL)   /* marks keystrokes we synthesize */
+#define TW_INPUT_TAG ((ULONG_PTR)0x5457495350ULL)   /* marks keystrokes we synthesize */
 
 static void send_ctrl_v(void)
 {
     INPUT in[4] = {0};
-    for (int i = 0; i < 4; i++) { in[i].type = INPUT_KEYBOARD; in[i].ki.dwExtraInfo = LW_INPUT_TAG; }
+    for (int i = 0; i < 4; i++) { in[i].type = INPUT_KEYBOARD; in[i].ki.dwExtraInfo = TW_INPUT_TAG; }
     in[0].ki.wVk = VK_CONTROL;
     in[1].ki.wVk = 'V';
     in[2].ki.wVk = 'V';  in[2].ki.dwFlags = KEYEVENTF_KEYUP;
@@ -1513,12 +1513,12 @@ static void send_ctrl_v(void)
 
 static void paste_now(const char *text)
 {
-#ifdef LW_TEST   /* test builds only paste into the harness (LW_PASTE_PID), never into your other windows */
+#ifdef TW_TEST   /* test builds only paste into the harness (TW_PASTE_PID), never into your other windows */
     {
         char want[16];
         DWORD pid = 0;
         GetWindowThreadProcessId(GetForegroundWindow(), &pid);
-        if (GetEnvironmentVariableA("LW_PASTE_PID", want, sizeof want) && pid != (DWORD)atoi(want)) {
+        if (GetEnvironmentVariableA("TW_PASTE_PID", want, sizeof want) && pid != (DWORD)atoi(want)) {
             dbg("paste: refused, foreground pid %lu is not the harness", (unsigned long)pid);
             return;
         }
@@ -1527,7 +1527,7 @@ static void paste_now(const char *text)
     if (!g_snap.valid) snap_take();          /* keep the user's original across back-to-back pastes */
     if (!clip_set_text(text, 1)) { dbg("paste: clipboard busy"); return; }
     g_snap.seq = GetClipboardSequenceNumber();
-#ifdef LW_TEST
+#ifdef TW_TEST
     {
         wchar_t cls[64] = L"";
         HWND fg = GetForegroundWindow();
@@ -2078,7 +2078,7 @@ static void dict_open(void)
         MONITORINFO mi = {sizeof mi};
         GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY), &mi);
         RECT wa = mi.rcWork;
-        g_dictWnd = CreateWindowExW(0, L"LocalWisprDict", L"LocalWispr dictionary", style,
+        g_dictWnd = CreateWindowExW(0, L"TinyWisprDict", L"TinyWispr dictionary", style,
                                     (wa.left + wa.right - w) / 2, (wa.top + wa.bottom - h) / 2, w, h,
                                     NULL, NULL, g_inst, NULL);
         if (!g_dictWnd) return;
@@ -2158,8 +2158,8 @@ static void rec_finish(int submit)
     int loud = R.peak >= SILENCE_PEAK;
     dbg("rec_finish submit=%d pcm=%lu (%lu ms) held=%llu ms firstData=%llu ms peak=%d", submit, (unsigned long)pcm,
         (unsigned long)(pcm / (BYTES_PER_SEC / 1000)), now_ms() - R.t0, R.tFirst ? R.tFirst - R.t0 : 0, R.peak);
-#ifdef LW_TEST
-    if (GetEnvironmentVariableA("LW_FAKE", NULL, 0)) loud = 1;
+#ifdef TW_TEST
+    if (GetEnvironmentVariableA("TW_FAKE", NULL, 0)) loud = 1;
 #endif
     if (submit && wav && pcm >= MIN_REC_BYTES && loud) {
         memcpy(wav, "RIFF", 4); put32(wav + 4, len - 8); memcpy(wav + 8, "WAVEfmt ", 8);
@@ -2242,7 +2242,7 @@ static void send_mask_key(void)
     /* An unassigned key between Win-down and Win-up stops the Start menu from opening. */
     INPUT in[2] = {0};
     in[0].type = in[1].type = INPUT_KEYBOARD;
-    in[0].ki.dwExtraInfo = in[1].ki.dwExtraInfo = LW_INPUT_TAG;
+    in[0].ki.dwExtraInfo = in[1].ki.dwExtraInfo = TW_INPUT_TAG;
     in[0].ki.wVk = in[1].ki.wVk = 0xE8;
     in[1].ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput(2, in, sizeof(INPUT));
@@ -2252,8 +2252,8 @@ static LRESULT CALLBACK ll_proc(int code, WPARAM wp, LPARAM lp)
 {
     if (code != HC_ACTION) return CallNextHookEx(NULL, code, wp, lp);
     KBDLLHOOKSTRUCT *k = (KBDLLHOOKSTRUCT *)lp;
-#ifdef LW_TEST   /* test builds accept simulated keys, except our own */
-    if (k->dwExtraInfo == LW_INPUT_TAG) return CallNextHookEx(NULL, code, wp, lp);
+#ifdef TW_TEST   /* test builds accept simulated keys, except our own */
+    if (k->dwExtraInfo == TW_INPUT_TAG) return CallNextHookEx(NULL, code, wp, lp);
 #else            /* ignore all synthetic keys: only real key presses trigger dictation */
     if (k->flags & LLKHF_INJECTED) return CallNextHookEx(NULL, code, wp, lp);
 #endif
@@ -2263,7 +2263,7 @@ static LRESULT CALLBACK ll_proc(int code, WPARAM wp, LPARAM lp)
     int isAlt = vk == VK_LMENU || vk == VK_RMENU;
     int isMod = isCtrl || isWin || isAlt || vk == VK_RCONTROL || vk == VK_LSHIFT || vk == VK_RSHIFT;
     LONG mode = g_mode;
-#ifdef LW_TEST
+#ifdef TW_TEST
     if (isCtrl || isWin || isAlt || mode != M_IDLE)
         dbg("hook %s vk=%02x mode=%d", isDown ? "down" : "up  ", (unsigned)vk, (int)mode);
 #endif
@@ -2437,7 +2437,7 @@ static LRESULT CALLBACK main_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     case WM_COPYDATA: {
         COPYDATASTRUCT *cd = (COPYDATASTRUCT *)lp;
-        if (!cd || cd->dwData != LW_COPYDATA_LEARNED || !cd->cbData || cd->cbData > 65536) return FALSE;
+        if (!cd || cd->dwData != TW_COPYDATA_LEARNED || !cd->cbData || cd->cbData > 65536) return FALSE;
         char *list = (char *)malloc(cd->cbData + 1);
         memcpy(list, cd->lpData, cd->cbData);
         list[cd->cbData] = 0;
@@ -2500,7 +2500,12 @@ static void init_paths(void)
 {
     wchar_t base[MAX_PATH];
     if (!GetEnvironmentVariableW(L"APPDATA", base, MAX_PATH)) wcscpy(base, L".");
-    _snwprintf(g_dir, MAX_PATH - 1, L"%ls\\LocalWispr", base);
+    _snwprintf(g_dir, MAX_PATH - 1, L"%ls\\TinyWispr", base);
+    wchar_t old[MAX_PATH];   /* the app used to be called LocalWispr: bring settings, history and dictionary along */
+    _snwprintf(old, MAX_PATH - 1, L"%ls\\LocalWispr", base);
+    old[MAX_PATH - 1] = 0;
+    if (GetFileAttributesW(g_dir) == INVALID_FILE_ATTRIBUTES && GetFileAttributesW(old) != INVALID_FILE_ATTRIBUTES)
+        MoveFileW(old, g_dir);
     CreateDirectoryW(g_dir, NULL);
     _snwprintf(g_cfgPath, MAX_PATH - 1, L"%ls\\config.ini", g_dir);
     _snwprintf(g_promptPath, MAX_PATH - 1, L"%ls\\prompt.txt", g_dir);
@@ -2511,7 +2516,7 @@ static void init_paths(void)
     write_file_if_missing(g_dictPath, DEFAULT_DICTIONARY);
 }
 
-/* localwispr.exe --test in.wav out.txt : run one clip through the pipeline and write the result. */
+/* tinywispr.exe --test in.wav out.txt : run one clip through the pipeline and write the result. */
 static int run_test(const wchar_t *in, const wchar_t *out)
 {
     DWORD len;
@@ -2549,8 +2554,8 @@ static int run_test(const wchar_t *in, const wchar_t *out)
     return j.err[0] ? 1 : 0;
 }
 
-#ifdef LW_TEST
-/* localwispr-test.exe --unit out.txt : deterministic checks of the learner and echo filter. */
+#ifdef TW_TEST
+/* tinywispr-test.exe --unit out.txt : deterministic checks of the learner and echo filter. */
 static int run_unit(const wchar_t *out)
 {
     static const struct { const wchar_t *orig, *field; const char *expect; } L[] = {
@@ -2610,17 +2615,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     init_paths();
     if (argv && argc >= 4 && !wcscmp(argv[1], L"--test")) return run_test(argv[2], argv[3]);
-#ifdef LW_TEST
+#ifdef TW_TEST
     if (argv && argc >= 3 && !wcscmp(argv[1], L"--unit")) return run_unit(argv[2]);
 #endif
     if (argv && argc >= 3 && !wcscmp(argv[1], L"--watch"))
         return watch_main((HWND)(ULONG_PTR)_wcstoui64(argv[2], NULL, 10));
     LocalFree(argv);
 
-#ifdef LW_TEST   /* test builds may run next to the installed app */
-    HANDLE mtx = CreateMutexW(NULL, TRUE, L"Local\\LocalWispr.Test.SingleInstance");
+#ifdef TW_TEST   /* test builds may run next to the installed app */
+    HANDLE mtx = CreateMutexW(NULL, TRUE, L"Local\\TinyWispr.Test.SingleInstance");
 #else
-    HANDLE mtx = CreateMutexW(NULL, TRUE, L"Local\\LocalWispr.SingleInstance");
+    HANDLE mtx = CreateMutexW(NULL, TRUE, L"Local\\TinyWispr.SingleInstance");
 #endif
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
     (void)mtx;
@@ -2650,24 +2655,24 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     wc.hInstance = inst;
     wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
     wc.lpfnWndProc = main_proc;
-    wc.lpszClassName = L"LocalWisprMain";
+    wc.lpszClassName = L"TinyWisprMain";
     RegisterClassW(&wc);
     wc.lpfnWndProc = overlay_proc;
-    wc.lpszClassName = L"LocalWisprOverlay";
+    wc.lpszClassName = L"TinyWisprOverlay";
     RegisterClassW(&wc);
     wc.lpfnWndProc = hist_proc;
-    wc.lpszClassName = L"LocalWisprHistory";
+    wc.lpszClassName = L"TinyWisprHistory";
     RegisterClassW(&wc);
     wc.lpfnWndProc = dict_proc;
-    wc.lpszClassName = L"LocalWisprDict";
+    wc.lpszClassName = L"TinyWisprDict";
     wc.hIcon = g_icoIdle;
     RegisterClassW(&wc);
 
-    g_main = CreateWindowExW(0, L"LocalWisprMain", APP_NAME, WS_OVERLAPPED, 0, 0, 0, 0, NULL, NULL, inst, NULL);
+    g_main = CreateWindowExW(0, L"TinyWisprMain", APP_NAME, WS_OVERLAPPED, 0, 0, 0, 0, NULL, NULL, inst, NULL);
     g_overlay = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
-                                L"LocalWisprOverlay", L"", WS_POPUP, 0, 0, 10, 10, NULL, NULL, inst, NULL);
+                                L"TinyWisprOverlay", L"", WS_POPUP, 0, 0, 10, 10, NULL, NULL, inst, NULL);
     SetLayeredWindowAttributes(g_overlay, 0, 242, LWA_ALPHA);
-    g_histwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"LocalWisprHistory", L"",
+    g_histwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"TinyWisprHistory", L"",
                                 WS_POPUP, 0, 0, 10, 10, NULL, NULL, inst, NULL);
     DWORD corner = 2; /* DWMWCP_ROUND (Windows 11) */
     DwmSetWindowAttribute(g_histwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &corner, sizeof corner);
