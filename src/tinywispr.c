@@ -32,14 +32,14 @@
 #include <uiautomation.h>
 
 #define APP_NAME      L"TinyWispr"
-#define SAMPLE_RATE   16000
+#define SAMPLE_RATE   24000                      /* the rate the Realtime API takes */
 #define BYTES_PER_SEC (SAMPLE_RATE * 2)          /* 16-bit mono */
 #define NBUF          8
 #define BUF_BYTES     (BYTES_PER_SEC / 10)       /* 100 ms per buffer */
 #define WAV_HDR       44
 #define MAX_REC_BYTES (BYTES_PER_SEC * 600)      /* 10 minutes */
 #define MIN_REC_BYTES (BYTES_PER_SEC / 4)       /* 250 ms */
-#define SILENCE_PEAK  150                        /* below this the clip is treated as silence */
+#define MIN_SEND_BYTES (BYTES_PER_SEC * 65 / 100) /* a press this short (650 ms, tail included) is never sent */
 #define TAIL_MS       150                        /* keep recording briefly after release */
 #define RESTORE_MS    1000                       /* restore the clipboard this long after pasting */
 #define HIST_N        5
@@ -49,6 +49,15 @@
 #define DICT_PROMPT_CHARS 800                    /* dictionary words sent to the transcriber */
 #define DICT_CLEANUP_CHARS 6000                  /* dictionary words sent to the cleanup model */
 #define TW_COPYDATA_LEARNED 0x5457               /* WM_COPYDATA tag: watcher -> app */
+#define LIVE_WAIT_MS  6000                       /* how long to wait for the live transcript before uploading instead */
+#define LIVE_SEND_BYTES BYTES_PER_SEC            /* most audio in one Realtime message */
+#define VAD_SAMPLES   (SAMPLE_RATE / 50)         /* 20 ms frames */
+#define VAD_MIN_ENERGY 3600.0f                   /* mean sample^2: RMS 60, below this is never speech */
+#define VAD_RATIO     4.0f                       /* a frame is voiced at 4x the noise energy (2x its RMS): errs toward keeping audio */
+#define VAD_RESUME_FRAMES 3                      /* 60 ms of voice ends a pause; a key click is shorter */
+#define VAD_SPEECH_FRAMES 8                      /* 160 ms of voice means someone is talking */
+#define VAD_KEEP_FRAMES 35                       /* a pause keeps its first 700 ms... */
+#define VAD_PREROLL_FRAMES 10                    /* ...and its last 200 ms, so word onsets survive */
 
 enum { WM_TRAY = WM_APP + 1, WM_REC_START, WM_REC_STOP, WM_HIST_SHOW, WM_HIST_MOVE,
        WM_HIST_END, WM_JOB_DONE, WM_JOB_ERROR, WM_REC_LOCK, WM_DICT_OPEN };
@@ -114,6 +123,10 @@ static const char DEFAULT_CONFIG[] =
 "transcribe_model=gpt-4o-mini-transcribe\r\n"
 "; Optional language code such as en. Blank = auto-detect.\r\n"
 "language=\r\n"
+"; 1 = stream audio to OpenAI while you talk (faster), 0 = upload it only when you finish\r\n"
+"streaming=1\r\n"
+"; 1 = shorten long pauses to under a second before sending, 0 = send them as recorded\r\n"
+"trim_pauses=1\r\n"
 "\r\n"
 "[cleanup]\r\n"
 "; 1 = run the cleanup prompt in prompt.txt, 0 = paste the raw transcript\r\n"
@@ -348,7 +361,7 @@ static void write_file_if_missing(const wchar_t *path, const char *data)
 
 typedef struct {
     char key[256], tmodel[64], cmodel[64], lang[16], effort[16], agent[64];
-    int cleanup;
+    int cleanup, streaming;
 } Cfg;
 
 static void ini_get(const wchar_t *sec, const wchar_t *k, const wchar_t *def, char *out, int n)
@@ -371,6 +384,8 @@ static void load_cfg(Cfg *c)
     }
     ini_get(L"openai", L"transcribe_model", L"gpt-4o-mini-transcribe", c->tmodel, sizeof c->tmodel);
     ini_get(L"openai", L"language", L"", c->lang, sizeof c->lang);
+    ini_get(L"openai", L"streaming", L"1", tmp, sizeof tmp);
+    c->streaming = tmp[0] != '0';
 
     ini_get(L"cleanup", L"enabled", L"1", tmp, sizeof tmp);
     c->cleanup = tmp[0] != '0';
@@ -664,12 +679,299 @@ static void mp_field(Sb *s, const char *b, const char *name, const char *val)
     sb_str(s, name); sb_str(s, "\"\r\n\r\n"); sb_str(s, val); sb_str(s, "\r\n");
 }
 
+static HINTERNET net_open(void)
+{
+    HINTERNET ses = WinHttpOpen(L"TinyWispr/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses) ses = WinHttpOpen(L"TinyWispr/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (ses) WinHttpSetTimeouts(ses, 10000, 10000, 60000, 90000);
+    return ses;
+}
+
+/* ---------------------------------------------------------- live streaming */
+
+/*
+ * While the keys are held, audio streams to the Realtime API, so most of the transcription
+ * wait disappears on release. The thread also warms an HTTPS connection for the requests that
+ * follow. The recording stays local too: on any failure the job uploads it the normal way.
+ * Everything here is gone once the job ends.
+ */
+typedef struct {
+    volatile LONG refs, stop, cancel;
+    HANDLE wake, done;
+    CRITICAL_SECTION cs;
+    Sb pending;            /* PCM waiting to be sent (under cs) */
+    HINTERNET ses, con;
+    PVOID volatile ws;     /* whoever swaps this out closes it */
+    char *text;            /* final transcript, set before done is signalled */
+    char usage[256];       /* the server's usage report, for --test */
+} Live;
+
+static void grab_usage(char *out, size_t n, const char *js)
+{
+    const char *p = strstr(js, "\"usage\"");
+    snprintf(out, n, "%s", p ? p : "none");
+    for (char *q = out; *q; q++) if (*q == '\n' || *q == '\r') *q = ' ';
+}
+
+static void live_release(Live *L)
+{
+    if (InterlockedDecrement(&L->refs)) return;
+    WinHttpCloseHandle(L->con);
+    WinHttpCloseHandle(L->ses);
+    CloseHandle(L->wake);
+    CloseHandle(L->done);
+    DeleteCriticalSection(&L->cs);
+    free(L->pending.p);
+    free(L->text);
+    free(L);
+}
+
+/* Fetch anything over TLS, unauthenticated, so the connection is pooled and ready. */
+static void net_warm(HINTERNET con)
+{
+    HINTERNET rq = WinHttpOpenRequest(con, L"GET", L"/v1/models", NULL, WINHTTP_NO_REFERER,
+                                      WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!rq) return;
+    if (WinHttpSendRequest(rq, NULL, 0, NULL, 0, 0, 0) && WinHttpReceiveResponse(rq, NULL)) {
+        char b[1024];
+        for (;;) {
+            DWORD av = 0, rd = 0;
+            if (!WinHttpQueryDataAvailable(rq, &av) || !av) break;
+            if (!WinHttpReadData(rq, b, av > sizeof b ? sizeof b : av, &rd) || !rd) break;
+        }
+    }
+    WinHttpCloseHandle(rq);
+}
+
+static int ws_send(HINTERNET ws, const Sb *m)
+{
+    return WinHttpWebSocketSend(ws, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, m->p, (DWORD)m->n) == NO_ERROR;
+}
+
+static HINTERNET live_connect(HINTERNET con, const Cfg *c, const char *dict)
+{
+    HINTERNET rq = WinHttpOpenRequest(con, L"GET", L"/v1/realtime?intent=transcription", NULL, WINHTTP_NO_REFERER,
+                                      WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!rq) return NULL;
+    char hdr[300];
+    snprintf(hdr, sizeof hdr, "Authorization: Bearer %s\r\n", c->key);
+    wchar_t *whdr = to_wide(hdr);
+    HINTERNET ws = NULL;
+    if (WinHttpSetOption(rq, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0) &&
+        WinHttpSendRequest(rq, whdr, (DWORD)-1L, NULL, 0, 0, 0) && WinHttpReceiveResponse(rq, NULL))
+        ws = WinHttpWebSocketCompleteUpgrade(rq, 0);
+    free(whdr);
+    WinHttpCloseHandle(rq);
+    if (!ws) return NULL;
+    /* turn_detection null: the transcript is cut when the keys come up, not at pauses. */
+    Sb js = {0};
+    sb_str(&js, "{\"type\":\"session.update\",\"session\":{\"type\":\"transcription\",\"audio\":{\"input\":{"
+                "\"format\":{\"type\":\"audio/pcm\",\"rate\":24000},\"turn_detection\":null,\"transcription\":{\"model\":");
+    sb_json(&js, c->tmodel);
+    if (c->lang[0]) {
+        int plural = !strcmp(c->tmodel, "gpt-live-transcribe");   /* this model takes "languages" only */
+        sb_str(&js, plural ? ",\"languages\":[" : ",\"language\":");
+        sb_json(&js, c->lang);
+        if (plural) sb_str(&js, "]");
+    }
+#ifdef TW_TEST
+    { char d[16]; if (GetEnvironmentVariableA("TW_LIVE_DELAY", d, sizeof d)) { sb_str(&js, ",\"delay\":"); sb_json(&js, d); } }
+#endif
+    if (dict) { sb_str(&js, ",\"prompt\":"); sb_json(&js, dict); }
+    sb_str(&js, "}}}}}");
+    int ok = ws_send(ws, &js);
+    free(js.p);
+    if (!ok) { WinHttpCloseHandle(ws); return NULL; }
+    return ws;
+}
+
+static int live_send_audio(HINTERNET ws, const BYTE *p, size_t n)
+{
+    static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    Sb m = {0};
+    sb_str(&m, "{\"type\":\"input_audio_buffer.append\",\"audio\":\"");
+    for (size_t i = 0; i < n; i += 3) {
+        unsigned v = p[i] << 16 | (i + 1 < n ? p[i + 1] << 8 : 0) | (i + 2 < n ? p[i + 2] : 0);
+        char o[4] = {B64[v >> 18], B64[(v >> 12) & 63], i + 1 < n ? B64[(v >> 6) & 63] : '=', i + 2 < n ? B64[v & 63] : '='};
+        sb_add(&m, o, 4);
+    }
+    sb_str(&m, "\"}");
+    int ok = ws_send(ws, &m);
+    free(m.p);
+    return ok;
+}
+
+/* Commit the audio and read events until the transcript arrives. NULL if it fails. */
+static char *live_commit(Live *L, HINTERNET ws)
+{
+    Sb m = {0};
+    sb_str(&m, "{\"type\":\"input_audio_buffer.commit\"}");
+    int ok = ws_send(ws, &m);
+    char *text = NULL;
+    m.n = 0;
+    while (ok) {
+        DWORD rd = 0;
+        WINHTTP_WEB_SOCKET_BUFFER_TYPE ty;
+        sb_need(&m, 16384);
+        if (WinHttpWebSocketReceive(ws, m.p + m.n, 16384, &rd, &ty) != NO_ERROR) break;
+        if (ty == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) break;
+        m.n += rd;
+        m.p[m.n] = 0;
+        if (ty == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE || ty == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE) continue;
+        char *ev = json_get_str(m.p, "type");
+        if (ev) {
+            if (!strcmp(ev, "error") || strstr(ev, "transcription.failed")) ok = 0;
+            else if (strstr(ev, "transcription.completed")) {
+                text = json_get_str(m.p, "transcript");
+                grab_usage(L->usage, sizeof L->usage, m.p);
+                ok = 0;
+            }
+            if (!strcmp(ev, "error")) dbg("live: %.300s", m.p);
+            free(ev);
+        }
+        m.n = 0;
+    }
+    free(m.p);
+    return text;
+}
+
+static DWORD WINAPI live_thread(LPVOID p)
+{
+    Live *L = (Live *)p;
+    Cfg c;
+    load_cfg(&c);
+#ifdef TW_TEST   /* a model the Realtime API rejects: the server sends an error event */
+    GetEnvironmentVariableA("TW_LIVE_MODEL", c.tmodel, sizeof c.tmodel);
+    GetEnvironmentVariableA("TW_LIVE_LANG", c.lang, sizeof c.lang);
+#endif
+    int broken = 1;
+    HINTERNET ws = NULL;
+    if (c.key[0] && c.streaming) {
+#ifdef TW_TEST
+        if (!GetEnvironmentVariableA("TW_LIVE_BREAK", NULL, 0))
+#endif
+        {
+            char *dict = dict_joined(DICT_PROMPT_CHARS);
+#ifdef TW_TEST
+            if (GetEnvironmentVariableA("TW_LIVE_DICT", NULL, 0)) { free(dict); dict = _strdup("Sinead, Huntington, NDIL"); }
+#endif
+            ws = live_connect(L->con, &c, dict);
+            free(dict);
+        }
+        broken = !ws;
+        InterlockedExchangePointer(&L->ws, ws);
+    }
+    if (c.key[0] && !L->stop) net_warm(L->con);
+    for (;;) {
+        WaitForSingleObject(L->wake, INFINITE);
+        if (L->cancel) break;
+        int stopping = L->stop;      /* read before taking the audio: the last of it is queued before stop is set */
+        Sb out;
+        EnterCriticalSection(&L->cs);
+        out = L->pending;
+        memset(&L->pending, 0, sizeof L->pending);
+        LeaveCriticalSection(&L->cs);
+        for (size_t off = 0; !broken && off < out.n; off += LIVE_SEND_BYTES) {
+            size_t k = out.n - off < LIVE_SEND_BYTES ? out.n - off : LIVE_SEND_BYTES;
+            if (!live_send_audio(ws, (const BYTE *)out.p + off, k)) broken = 1;
+        }
+        free(out.p);
+        if (stopping) {
+            if (!broken) L->text = live_commit(L, ws);
+            break;
+        }
+    }
+    ws = InterlockedExchangePointer(&L->ws, NULL);
+    if (ws) WinHttpCloseHandle(ws);
+    SetEvent(L->done);
+    live_release(L);
+    return 0;
+}
+
+static Live *live_start(void)
+{
+#ifdef TW_TEST
+    if (GetEnvironmentVariableA("TW_FAKE", NULL, 0)) return NULL;
+#endif
+    HINTERNET ses = net_open();
+    HINTERNET con = ses ? WinHttpConnect(ses, L"api.openai.com", INTERNET_DEFAULT_HTTPS_PORT, 0) : NULL;
+    Live *L = con ? (Live *)calloc(1, sizeof(Live)) : NULL;
+    if (!L) {
+        if (con) WinHttpCloseHandle(con);
+        if (ses) WinHttpCloseHandle(ses);
+        return NULL;
+    }
+    L->refs = 2;              /* the thread, and whoever holds the recording or job */
+    L->ses = ses;
+    L->con = con;
+    InitializeCriticalSection(&L->cs);
+    L->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    L->done = CreateEventW(NULL, TRUE, FALSE, NULL);
+    HANDLE th = CreateThread(NULL, 0, live_thread, L, 0, NULL);
+    if (!th) {
+        L->refs = 1;
+        live_release(L);
+        return NULL;
+    }
+    CloseHandle(th);
+    return L;
+}
+
+static void live_feed(Live *L, const void *pcm, size_t n)
+{
+    EnterCriticalSection(&L->cs);
+    sb_add(&L->pending, pcm, n);
+    LeaveCriticalSection(&L->cs);
+    SetEvent(L->wake);
+}
+
+/* The recording ended: send what's left and commit. */
+static void live_stop(Live *L)
+{
+    InterlockedExchange(&L->stop, 1);
+    SetEvent(L->wake);
+}
+
+/* The recording was thrown away. */
+static void live_cancel(Live *L)
+{
+    InterlockedExchange(&L->cancel, 1);
+    InterlockedExchange(&L->stop, 1);
+    SetEvent(L->wake);
+    live_release(L);
+}
+
+/* Wait for the transcript. Returns it (caller frees), or NULL to fall back to the upload. */
+static char *live_result(Live *L, DWORD audioBytes)
+{
+    /* Long recordings take the server longer: allow 1 s more per 10 s of audio. */
+    DWORD wait = LIVE_WAIT_MS + audioBytes / (BYTES_PER_SEC / 100);
+#ifdef TW_TEST
+    if (GetEnvironmentVariableA("TW_LIVE_TIMEOUT", NULL, 0)) wait = 1;
+#endif
+    if (WaitForSingleObject(L->done, wait) != WAIT_OBJECT_0) {
+        dbg("live: timed out after %lu ms", (unsigned long)wait);
+        HINTERNET ws = InterlockedExchangePointer(&L->ws, NULL);
+        if (ws) WinHttpCloseHandle(ws);      /* unblocks the thread, which then exits by itself */
+        return NULL;
+    }
+    char *t = L->text;
+    L->text = NULL;
+    return t;
+}
+
 typedef struct {
     BYTE *wav;
     DWORD len;
+    Live *live;          /* the stream for this recording, or NULL (owned by the job) */
     char *text;          /* final text to paste (malloc'd, may be empty) */
     char *raw;           /* raw transcript, for --test */
     wchar_t err[256];
+    ULONGLONG msStt, msClean;
+    int usedLive;
+    char usage[256];
 } Job;
 
 static void run_job(Job *j)
@@ -684,52 +986,65 @@ static void run_job(Job *j)
     load_cfg(&c);
     if (!c.key[0]) {
         wcscpy(j->err, L"No OpenAI API key. Right-click the tray icon > Edit settings.");
+        if (j->live) live_release(j->live);
+        j->live = NULL;
         return;
     }
-    HINTERNET ses = WinHttpOpen(L"TinyWispr/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!ses) ses = WinHttpOpen(L"TinyWispr/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!ses) { wcscpy(j->err, L"Could not start WinHTTP"); return; }
-    WinHttpSetTimeouts(ses, 10000, 10000, 60000, 90000);
-    HINTERNET con = WinHttpConnect(ses, L"api.openai.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+    HINTERNET ses = NULL, con;
+    if (j->live) {
+        con = j->live->con;
+    } else {
+        ses = net_open();
+        if (!ses) { wcscpy(j->err, L"Could not start WinHTTP"); return; }
+        con = WinHttpConnect(ses, L"api.openai.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+    }
     char *resp = NULL, *raw = NULL;
     DWORD st;
 
     /* 1. Speech to text */
-    const char *b = "TinyWisprBoundary7f3a91c2";
-    Sb body = {0};
-    mp_field(&body, b, "model", c.tmodel);
-    mp_field(&body, b, "response_format", "json");
-    if (c.lang[0]) mp_field(&body, b, "language", c.lang);
+    ULONGLONG t0 = now_ms();
     char *dictPrompt = dict_joined(DICT_PROMPT_CHARS);
-    if (dictPrompt) mp_field(&body, b, "prompt", dictPrompt);
-    sb_str(&body, "--"); sb_str(&body, b);
-    sb_str(&body, "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n");
-    sb_add(&body, j->wav, j->len);
-    sb_str(&body, "\r\n--"); sb_str(&body, b); sb_str(&body, "--\r\n");
-    free(j->wav);          /* the audio now lives only in the request body */
-    j->wav = NULL;
-    char ctype[96];
-    snprintf(ctype, sizeof ctype, "multipart/form-data; boundary=%s", b);
-    resp = con ? http_post(con, L"/v1/audio/transcriptions", c.key, ctype, body.p, (DWORD)body.n, &st) : NULL;
-    free(body.p);
-    if (!resp) {
-        wchar_t e[32];
-        _snwprintf(e, 31, L"error %lu", (unsigned long)GetLastError());
-        e[31] = 0;
-        _snwprintf(j->err, 255, L"Couldn't reach OpenAI (%ls). Check your connection.", e);
-        goto done;
+    if (j->live) raw = live_result(j->live, j->len);
+    if (raw) {
+        j->usedLive = 1;
+        strcpy(j->usage, j->live->usage);
+    } else {
+        const char *b = "TinyWisprBoundary7f3a91c2";
+        Sb body = {0};
+        /* gpt-live-transcribe only works over the Realtime API. */
+        mp_field(&body, b, "model", strcmp(c.tmodel, "gpt-live-transcribe") ? c.tmodel : "gpt-transcribe");
+        mp_field(&body, b, "response_format", "json");
+        if (c.lang[0]) mp_field(&body, b, "language", c.lang);
+        if (dictPrompt) mp_field(&body, b, "prompt", dictPrompt);
+        sb_str(&body, "--"); sb_str(&body, b);
+        sb_str(&body, "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n");
+        sb_add(&body, j->wav, j->len);
+        sb_str(&body, "\r\n--"); sb_str(&body, b); sb_str(&body, "--\r\n");
+        free(j->wav);          /* the audio now lives only in the request body */
+        j->wav = NULL;
+        char ctype[96];
+        snprintf(ctype, sizeof ctype, "multipart/form-data; boundary=%s", b);
+        resp = con ? http_post(con, L"/v1/audio/transcriptions", c.key, ctype, body.p, (DWORD)body.n, &st) : NULL;
+        free(body.p);
+        if (!resp) {
+            wchar_t e[32];
+            _snwprintf(e, 31, L"error %lu", (unsigned long)GetLastError());
+            e[31] = 0;
+            _snwprintf(j->err, 255, L"Couldn't reach OpenAI (%ls). Check your connection.", e);
+            goto done;
+        }
+        if (st != 200) {
+            char *m = json_get_str(resp, "message");
+            set_err(j->err, L"Transcription failed", st, m ? m : resp);
+            free(m);
+            goto done;
+        }
+        raw = json_get_str(resp, "text");
+        grab_usage(j->usage, sizeof j->usage, resp);
+        free(resp);
+        resp = NULL;
     }
-    if (st != 200) {
-        char *m = json_get_str(resp, "message");
-        set_err(j->err, L"Transcription failed", st, m ? m : resp);
-        free(m);
-        goto done;
-    }
-    raw = json_get_str(resp, "text");
-    free(resp);
-    resp = NULL;
+    j->msStt = now_ms() - t0;
     trim_inplace(raw);
     if (!raw || !raw[0]) goto done;
     if (dictPrompt && is_dictionary_echo(raw, dictPrompt)) goto done;   /* model recited the word list */
@@ -765,7 +1080,9 @@ static void run_job(Job *j)
         sb_str(&js, "}");
         free(prompt);
         free(user.p);
+        t0 = now_ms();
         resp = http_post(con, L"/v1/chat/completions", c.key, "application/json", js.p, (DWORD)js.n, &st);
+        j->msClean = now_ms() - t0;
         free(js.p);
         char *clean = (resp && st == 200) ? json_get_str(resp, "content") : NULL;
         if (clean) {
@@ -785,8 +1102,13 @@ done:
     free(dictPrompt);
     free(resp);
     free(raw);
-    if (con) WinHttpCloseHandle(con);
-    WinHttpCloseHandle(ses);
+    if (j->live) {
+        live_release(j->live);
+        j->live = NULL;
+    } else {
+        if (con) WinHttpCloseHandle(con);
+        WinHttpCloseHandle(ses);
+    }
 }
 
 static DWORD WINAPI job_thread(LPVOID p)
@@ -1590,6 +1912,16 @@ typedef struct {
     int next, peak, tail, released;
     float level;
     ULONGLONG t0, tFirst;
+    Live *live;
+    /* speech detection and pause trimming */
+    short frame[VAD_SAMPLES], pre[VAD_PREROLL_FRAMES][VAD_SAMPLES];
+    int frameN, preN, preNext;
+    float floor;         /* noise energy estimate; negative until the first frame */
+    int run, quiet;      /* leaky count of voiced frames; unvoiced frames in a row */
+    int keeping;         /* audio is going out, as opposed to being skipped as a pause */
+    int speech;          /* someone is talking: only now does anything go to OpenAI */
+    int trim, noLive, liveTried;
+    DWORD rawBytes;
 } Rec;
 static Rec R;
 
@@ -2091,6 +2423,93 @@ static void dict_open(void)
 
 /* -------------------------------------------------------------- recording */
 
+static void rec_keep(const void *pcm, DWORD n)
+{
+    if (R.len + n > R.cap) {
+        DWORD c = R.cap ? R.cap * 2 : 128 * 1024;
+        while (c < R.len + n) c *= 2;
+        BYTE *nb = (BYTE *)realloc(R.buf, c);
+        if (nb) { R.buf = nb; R.cap = c; }
+    }
+    if (R.len + n <= R.cap) {
+        memcpy(R.buf + R.len, pcm, n);
+        R.len += n;
+    }
+    if (R.live) live_feed(R.live, pcm, n);
+}
+
+/* Decides, 20 ms at a time, what is speech and what goes out. Silence before the first word and
+   the middle of long pauses are dropped, so a press with nobody talking leaves nothing to send. */
+static void rec_frame(const short *s)
+{
+    const DWORD bytes = VAD_SAMPLES * 2;
+    float e = 0;
+    for (int i = 0; i < VAD_SAMPLES; i++) e += (float)s[i] * s[i];
+    e /= VAD_SAMPLES;
+    /* The noise floor is the average of the frames that aren't voice. It drops fast after a loud
+       start (the key click) and creeps up during voice, in case the room really got louder. */
+    if (R.floor < 0) R.floor = e;
+    float thresh = R.floor * VAD_RATIO;
+    if (thresh < VAD_MIN_ENERGY) thresh = VAD_MIN_ENERGY;
+    int voiced = e >= thresh;
+    if (voiced) R.floor = R.floor * 1.004f + 0.01f;
+    else R.floor += (e < R.floor * 0.25f ? 0.3f : 0.05f) * (e - R.floor);
+    if (voiced) { if (R.run < VAD_SPEECH_FRAMES) R.run++; }
+    else if (R.run) R.run--;
+
+    if (!R.trim) {
+        rec_keep(s, bytes);
+    } else if (R.keeping) {
+        rec_keep(s, bytes);
+        R.quiet = voiced ? 0 : R.quiet + 1;
+        if (R.quiet >= VAD_KEEP_FRAMES) { R.keeping = 0; R.preN = R.preNext = R.run = 0; }
+    } else {
+        memcpy(R.pre[R.preNext], s, bytes);
+        R.preNext = (R.preNext + 1) % VAD_PREROLL_FRAMES;
+        if (R.preN < VAD_PREROLL_FRAMES) R.preN++;
+        if (R.run >= VAD_RESUME_FRAMES) {
+            int first = (R.preNext - R.preN + VAD_PREROLL_FRAMES) % VAD_PREROLL_FRAMES;
+            for (int i = 0; i < R.preN; i++) rec_keep(R.pre[(first + i) % VAD_PREROLL_FRAMES], bytes);
+            R.keeping = 1;
+            R.quiet = 0;
+        }
+    }
+    if (R.run >= VAD_SPEECH_FRAMES) R.speech = 1;
+    if (R.speech && !R.liveTried && !R.noLive && R.rawBytes >= MIN_SEND_BYTES) {
+        R.liveTried = 1;
+        R.live = live_start();
+        if (R.live && R.len > WAV_HDR) live_feed(R.live, R.buf + WAV_HDR, R.len - WAV_HDR);
+    }
+}
+
+static void rec_audio(const void *pcm, DWORD n)
+{
+    const short *s = (const short *)pcm;
+    R.rawBytes += n;
+    for (DWORD i = 0; i < n / 2; i++) {
+        R.frame[R.frameN++] = s[i];
+        if (R.frameN == VAD_SAMPLES) {
+            rec_frame(R.frame);
+            R.frameN = 0;
+        }
+    }
+}
+
+static void rec_begin(void)
+{
+    R.buf = (BYTE *)malloc(128 * 1024);
+    R.cap = R.buf ? 128 * 1024 : 0;
+    R.len = WAV_HDR;                 /* leave room for the WAV header */
+    R.frameN = R.preN = R.preNext = R.run = R.quiet = R.keeping = R.speech = R.liveTried = 0;
+    R.floor = -1;
+    R.rawBytes = 0;
+    R.trim = GetPrivateProfileIntW(L"openai", L"trim_pauses", 1, g_cfgPath) != 0;
+#ifdef TW_TEST
+    { char v[8]; if (GetEnvironmentVariableA("TW_TRIM", v, sizeof v)) R.trim = v[0] != '0'; }
+    if (GetEnvironmentVariableA("TW_FAKE", NULL, 0)) R.trim = 0;   /* simulated presses have no real audio */
+#endif
+}
+
 static void harvest(int requeue)
 {
     for (int k = 0; k < NBUF && R.h; k++) {
@@ -2099,16 +2518,7 @@ static void harvest(int requeue)
         DWORD n = h->dwBytesRecorded;
         if (n && !R.tFirst) R.tFirst = now_ms();
         if (n) {
-            if (R.len + n > R.cap) {
-                DWORD c = R.cap ? R.cap * 2 : 128 * 1024;
-                while (c < R.len + n) c *= 2;
-                BYTE *nb = (BYTE *)realloc(R.buf, c);
-                if (nb) { R.buf = nb; R.cap = c; }
-            }
-            if (R.len + n <= R.cap) {
-                memcpy(R.buf + R.len, h->lpData, n);
-                R.len += n;
-            }
+            rec_audio(h->lpData, n);
             int pk = 0;
             const short *s = (const short *)h->lpData;
             for (DWORD i = 0; i < n / 2; i++) { int v = s[i] < 0 ? -s[i] : s[i]; if (v > pk) pk = v; }
@@ -2123,19 +2533,57 @@ static void harvest(int requeue)
     }
 }
 
-static void start_job(BYTE *wav, DWORD len)
+static void start_job(BYTE *wav, DWORD len, Live *live)
 {
     Job *j = (Job *)calloc(1, sizeof(Job));
     j->wav = wav;
     j->len = len;
+    j->live = live;
     HANDLE th = CreateThread(NULL, 0, job_thread, j, 0, NULL);
-    if (!th) { free(wav); free(j); return; }
+    if (!th) {
+        if (live) live_cancel(live);
+        free(wav);
+        free(j);
+        return;
+    }
     CloseHandle(th);
     g_jobs++;
 }
 
 static void put32(BYTE *p, DWORD v) { p[0] = (BYTE)v; p[1] = (BYTE)(v >> 8); p[2] = (BYTE)(v >> 16); p[3] = (BYTE)(v >> 24); }
 static void put16(BYTE *p, WORD v) { p[0] = (BYTE)v; p[1] = (BYTE)(v >> 8); }
+
+/* Ends the recording's audio. Returns 1 with a complete WAV and its stream if there's speech to
+   transcribe; otherwise any stream is dropped uncommitted and nothing more goes to OpenAI. */
+static int rec_take(int submit, BYTE **wavOut, DWORD *lenOut, Live **liveOut)
+{
+    Live *live = R.live;
+    R.live = NULL;
+    BYTE *wav = R.buf;
+    DWORD len = R.len, pcm = len > WAV_HDR ? len - WAV_HDR : 0;
+    R.buf = NULL;
+    R.len = R.cap = 0;
+    int speech = R.speech && R.rawBytes >= MIN_SEND_BYTES;
+    dbg("rec_take submit=%d kept=%lu ms raw=%lu ms speech=%d floor=%.0f", submit, (unsigned long)(pcm / (BYTES_PER_SEC / 1000)),
+        (unsigned long)(R.rawBytes / (BYTES_PER_SEC / 1000)), speech, (double)R.floor);
+#ifdef TW_TEST
+    if (GetEnvironmentVariableA("TW_FAKE", NULL, 0)) speech = 1;
+#endif
+    if (!submit || !wav || pcm < MIN_REC_BYTES || !speech) {
+        if (live) live_cancel(live);
+        free(wav);
+        return 0;
+    }
+    memcpy(wav, "RIFF", 4); put32(wav + 4, len - 8); memcpy(wav + 8, "WAVEfmt ", 8);
+    put32(wav + 16, 16); put16(wav + 20, 1); put16(wav + 22, 1); put32(wav + 24, SAMPLE_RATE);
+    put32(wav + 28, BYTES_PER_SEC); put16(wav + 32, 2); put16(wav + 34, 16);
+    memcpy(wav + 36, "data", 4); put32(wav + 40, pcm);
+    if (live) live_stop(live);
+    *wavOut = wav;
+    *lenOut = len;
+    *liveOut = live;
+    return 1;
+}
 
 static void rec_finish(int submit)
 {
@@ -2151,25 +2599,12 @@ static void rec_finish(int submit)
     waveInClose(R.h);
     R.h = NULL;
 
-    BYTE *wav = R.buf;
-    DWORD len = R.len, pcm = len > WAV_HDR ? len - WAV_HDR : 0;
-    R.buf = NULL;
-    R.len = R.cap = 0;
-    int loud = R.peak >= SILENCE_PEAK;
-    dbg("rec_finish submit=%d pcm=%lu (%lu ms) held=%llu ms firstData=%llu ms peak=%d", submit, (unsigned long)pcm,
-        (unsigned long)(pcm / (BYTES_PER_SEC / 1000)), now_ms() - R.t0, R.tFirst ? R.tFirst - R.t0 : 0, R.peak);
-#ifdef TW_TEST
-    if (GetEnvironmentVariableA("TW_FAKE", NULL, 0)) loud = 1;
-#endif
-    if (submit && wav && pcm >= MIN_REC_BYTES && loud) {
-        memcpy(wav, "RIFF", 4); put32(wav + 4, len - 8); memcpy(wav + 8, "WAVEfmt ", 8);
-        put32(wav + 16, 16); put16(wav + 20, 1); put16(wav + 22, 1); put32(wav + 24, SAMPLE_RATE);
-        put32(wav + 28, BYTES_PER_SEC); put16(wav + 32, 2); put16(wav + 34, 16);
-        memcpy(wav + 36, "data", 4); put32(wav + 40, pcm);
-        start_job(wav, len);
-    } else {
-        free(wav);
-    }
+    BYTE *wav;
+    DWORD len;
+    Live *live;
+    dbg("rec_finish held=%llu ms firstData=%llu ms peak=%d", now_ms() - R.t0, R.tFirst ? R.tFirst - R.t0 : 0, R.peak);
+    if (rec_take(submit, &wav, &len, &live)) start_job(wav, len, live);
+    else if (submit && R.rawBytes >= BYTES_PER_SEC) overlay_message(L"Didn't hear anything", 2000);   /* too long for a stray tap */
     overlay_refresh();
     if (!g_jobs) SetTimer(g_main, T_TRIM, 1500, NULL);
 }
@@ -2191,9 +2626,7 @@ static void rec_start(void)
         tray_notify(APP_NAME, L"Couldn't open the microphone.");
         return;
     }
-    R.buf = (BYTE *)malloc(128 * 1024);
-    R.cap = R.buf ? 128 * 1024 : 0;
-    R.len = WAV_HDR;                 /* leave room for the WAV header */
+    rec_begin();
     R.next = R.peak = R.released = 0;
     R.level = 0;
     for (int i = 0; i < NBUF; i++) {
@@ -2212,7 +2645,7 @@ static void rec_tick(void)
 {
     if (!R.h) { KillTimer(g_main, T_REC); return; }
     harvest(1);
-    if (R.len >= MAX_REC_BYTES) {
+    if (R.rawBytes >= MAX_REC_BYTES) {
         InterlockedExchange(&g_mode, M_IDLE);
         rec_finish(1);
         return;
@@ -2516,8 +2949,10 @@ static void init_paths(void)
     write_file_if_missing(g_dictPath, DEFAULT_DICTIONARY);
 }
 
-/* tinywispr.exe --test in.wav out.txt : run one clip through the pipeline and write the result. */
-static int run_test(const wchar_t *in, const wchar_t *out)
+/* tinywispr.exe --test in.wav out.txt : run one clip through the pipeline and write the result.
+   --test-live does the same but streams the clip in real time first, as if it were being spoken
+   (24 kHz mono only); the time reported starts when the "keys come up". */
+static int run_test(const wchar_t *in, const wchar_t *out, int stream)
 {
     DWORD len;
     char *wav = read_file(in, &len);
@@ -2525,11 +2960,33 @@ static int run_test(const wchar_t *in, const wchar_t *out)
     Job j = {0};
     j.wav = (BYTE *)wav;
     j.len = len;
+    int sent = 1;
+    DWORD rawMs = (len - WAV_HDR) / (BYTES_PER_SEC / 1000), keptMs = rawMs;
+    if (stream) {
+        /* The same path as the microphone: detection, trimming and streaming. */
+        rec_begin();
+        for (DWORD off = WAV_HDR; off < len; off += BUF_BYTES) {
+            rec_audio(wav + off, len - off < BUF_BYTES ? len - off : BUF_BYTES);
+            Sleep(100);
+        }
+        keptMs = R.len > WAV_HDR ? (R.len - WAV_HDR) / (BYTES_PER_SEC / 1000) : 0;
+#ifdef TW_TEST
+        if (R.live && GetEnvironmentVariableA("TW_LIVE_CANCEL", NULL, 0)) {   /* recording thrown away: nothing left behind */
+            BYTE *w; DWORD l; Live *lv;
+            rec_take(0, &w, &l, &lv);
+            Sleep(1500);
+            return 0;
+        }
+#endif
+        free(wav);
+        j.wav = NULL;
+        sent = rec_take(1, &j.wav, &j.len, &j.live);
+    }
     ULONGLONG t0 = now_ms();
-    run_job(&j);
+    if (sent) run_job(&j);
     ULONGLONG ms = now_ms() - t0;
     Sb s = {0};
-    char tmp[64];
+    char tmp[448];
     sb_str(&s, "RAW: ");
     sb_str(&s, j.raw ? j.raw : "");
     sb_str(&s, "\nFINAL:\n");
@@ -2540,7 +2997,9 @@ static int run_test(const wchar_t *in, const wchar_t *out)
         WideCharToMultiByte(CP_UTF8, 0, j.err, -1, e, sizeof e, NULL, NULL);
         sb_str(&s, e);
     }
-    snprintf(tmp, sizeof tmp, "\nMS: %llu\n", (unsigned long long)ms);
+    snprintf(tmp, sizeof tmp, "\nMS: %llu stt=%llu (%s) cleanup=%llu\nAUDIO: sent=%d raw=%lu kept=%lu\nUSAGE: %s\n", (unsigned long long)ms,
+             (unsigned long long)j.msStt, j.usedLive ? "live" : "upload", (unsigned long long)j.msClean,
+             sent, (unsigned long)rawMs, (unsigned long)keptMs, j.usage);
     sb_str(&s, tmp);
     HANDLE f = CreateFileW(out, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
     if (f != INVALID_HANDLE_VALUE) {
@@ -2555,6 +3014,81 @@ static int run_test(const wchar_t *in, const wchar_t *out)
 }
 
 #ifdef TW_TEST
+/* Feeds audio through detection and trimming with no stream. Returns the milliseconds kept. */
+static DWORD trim_run(const short *pcm, DWORD samples)
+{
+    R.noLive = 1;
+    rec_begin();
+    R.trim = 1;
+    rec_audio(pcm, samples * 2);
+    DWORD ms = (R.len - WAV_HDR) / (BYTES_PER_SEC / 1000);
+    return ms;
+}
+
+/* tinywispr-test.exe --trim in.wav out.wav stats.txt : run a 24 kHz clip through the detector, offline. */
+static int run_trim(const wchar_t *in, const wchar_t *out, const wchar_t *stats)
+{
+    DWORD len;
+    char *wav = read_file(in, &len);
+    if (!wav || len <= WAV_HDR) return 2;
+    DWORD samples = (len - WAV_HDR) / 2;
+    DWORD ms = trim_run((const short *)(wav + WAV_HDR), samples);
+    char line[128];
+    int n = snprintf(line, sizeof line, "raw=%lu kept=%lu speech=%d floor_rms2=%.0f\n", (unsigned long)(samples / (SAMPLE_RATE / 1000)),
+                     (unsigned long)ms, R.speech, (double)R.floor);
+    HANDLE f = CreateFileW(stats, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (f != INVALID_HANDLE_VALUE) { DWORD wr; WriteFile(f, line, n, &wr, NULL); CloseHandle(f); }
+    BYTE *w; DWORD l; Live *lv;
+    if (rec_take(1, &w, &l, &lv)) {
+        f = CreateFileW(out, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        if (f != INVALID_HANDLE_VALUE) { DWORD wr; WriteFile(f, w, l, &wr, NULL); CloseHandle(f); }
+    }
+    return 0;
+}
+
+/* tinywispr-test.exe --mic-vad seconds stats.txt : the detector on the live microphone. Audio is
+   held in memory only: never written or sent. */
+static int run_mic_vad(int seconds, const wchar_t *stats)
+{
+    WAVEFORMATEX wf = {WAVE_FORMAT_PCM, 1, SAMPLE_RATE, BYTES_PER_SEC, 2, 16, 0};
+    HWAVEIN h;
+    if (waveInOpen(&h, WAVE_MAPPER, &wf, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) return 2;
+    DWORD total = BYTES_PER_SEC * seconds;
+    BYTE *pcm = (BYTE *)malloc(total);
+    WAVEHDR hdr = {0};
+    hdr.lpData = (LPSTR)pcm;
+    hdr.dwBufferLength = total;
+    waveInPrepareHeader(h, &hdr, sizeof hdr);
+    waveInAddBuffer(h, &hdr, sizeof hdr);
+    waveInStart(h);
+    while (!(((volatile WAVEHDR *)&hdr)->dwFlags & WHDR_DONE)) Sleep(50);
+    waveInReset(h);
+    DWORD got = hdr.dwBytesRecorded;
+    waveInUnprepareHeader(h, &hdr, sizeof hdr);
+    waveInClose(h);
+    DWORD ms = trim_run((const short *)pcm, got / 2);
+    char line[128];
+    int n = snprintf(line, sizeof line, "raw=%lu kept=%lu speech=%d floor_energy=%.0f\n", (unsigned long)(got / (BYTES_PER_SEC / 1000)),
+                     (unsigned long)ms, R.speech, (double)R.floor);
+    HANDLE f = CreateFileW(stats, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (f != INVALID_HANDLE_VALUE) { DWORD wr; WriteFile(f, line, n, &wr, NULL); CloseHandle(f); }
+    return 0;
+}
+
+/* Test signals: "voice" is a tone at RMS ~2000, "click" a 15 ms burst, "room" low noise. */
+static void sig_room(short *s, DWORD from, DWORD to)
+{
+    for (DWORD i = from; i < to; i++) s[i] = (short)((rand() % 81) - 40);
+}
+static void sig_voice(short *s, DWORD from, DWORD to)
+{
+    for (DWORD i = from; i < to; i++) s[i] = (i / 30) % 2 ? 2000 : -2000;
+}
+static void sig_click(short *s, DWORD at)
+{
+    for (DWORD i = at; i < at + SAMPLE_RATE * 15 / 1000; i++) s[i] = (i % 6) < 3 ? 8000 : -8000;
+}
+
 /* tinywispr-test.exe --unit out.txt : deterministic checks of the learner and echo filter. */
 static int run_unit(const wchar_t *out)
 {
@@ -2599,6 +3133,55 @@ static int run_unit(const wchar_t *out)
         snprintf(line, sizeof line, "%s echo #%d got=%d\n", ok ? "PASS" : "FAIL", (int)i, g);
         sb_str(&s, line);
     }
+    /* What gets sent. Rates are in samples; every recording starts with room noise and a click. */
+    {
+        const DWORD MS = SAMPLE_RATE / 1000, N = 30000 * MS;
+        short *a = (short *)malloc(N * 2);
+        char line_buf[160];
+#define TRIM_CASE(nm, sp, lo, hi, total) do { \
+            DWORD kept = trim_run(a, (total) * MS); \
+            int ok = R.speech == (sp) && kept >= (DWORD)(lo) && kept <= (DWORD)(hi); \
+            fails += !ok; \
+            char line[160]; \
+            snprintf(line, sizeof line, "%s gate %s speech=%d kept=%lu\n", ok ? "PASS" : "FAIL", nm, R.speech, (unsigned long)kept); \
+            sb_str(&s, line); \
+            free(R.buf); R.buf = NULL; \
+        } while (0)
+        sig_room(a, 0, 500 * MS); sig_click(a, 20 * MS); sig_click(a, 400 * MS);
+        TRIM_CASE("tap: clicks only, nothing to send", 0, 0, 300, 500);
+
+        sig_room(a, 0, 2000 * MS); sig_click(a, 20 * MS); sig_click(a, 1800 * MS);
+        TRIM_CASE("long press, nobody talking", 0, 0, 300, 2000);
+
+        sig_room(a, 0, 1000 * MS); sig_click(a, 20 * MS); sig_voice(a, 500 * MS, 800 * MS);
+        TRIM_CASE("one short word", 1, 300, 1000, 1000);
+
+        sig_room(a, 0, 12000 * MS); sig_click(a, 20 * MS); sig_voice(a, 500 * MS, 1500 * MS); sig_voice(a, 10500 * MS, 11500 * MS);
+        TRIM_CASE("nine second pause shrinks", 1, 2500, 3700, 12000);
+
+        sig_room(a, 0, 3000 * MS); sig_voice(a, 500 * MS, 1200 * MS); sig_voice(a, 1600 * MS, 2500 * MS);
+        TRIM_CASE("short pause stays whole", 1, 2100, 2800, 3000);
+
+        sig_room(a, 0, 12000 * MS); sig_voice(a, 500 * MS, 1500 * MS); sig_click(a, 5000 * MS); sig_voice(a, 10500 * MS, 11500 * MS);
+        TRIM_CASE("click in a pause doesn't restart it", 1, 2500, 3700, 12000);
+#undef TRIM_CASE
+        /* A press too short to be dictation isn't sent, even with sound in it. */
+        BYTE *w; DWORD wl; Live *lv;
+        sig_room(a, 0, 500 * MS); sig_voice(a, 50 * MS, 450 * MS);
+        trim_run(a, 500 * MS);
+        int heard = R.speech, took = rec_take(1, &w, &wl, &lv);
+        fails += !(heard && !took);
+        snprintf(line_buf, sizeof line_buf, "%s gate voice in a 500 ms press heard=%d sent=%d\n", heard && !took ? "PASS" : "FAIL", heard, took);
+        sb_str(&s, line_buf);
+        sig_room(a, 0, 1000 * MS); sig_voice(a, 200 * MS, 700 * MS);
+        trim_run(a, 1000 * MS);
+        took = rec_take(1, &w, &wl, &lv);
+        fails += !took;
+        snprintf(line_buf, sizeof line_buf, "%s gate voice in a 1000 ms press sent=%d\n", took ? "PASS" : "FAIL", took);
+        sb_str(&s, line_buf);
+        if (took) free(w);
+        free(a);
+    }
     HANDLE f = CreateFileW(out, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
     if (f != INVALID_HANDLE_VALUE) { DWORD wr; WriteFile(f, s.p, (DWORD)s.n, &wr, NULL); CloseHandle(f); }
     free(s.p);
@@ -2614,9 +3197,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     int argc = 0;
     wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     init_paths();
-    if (argv && argc >= 4 && !wcscmp(argv[1], L"--test")) return run_test(argv[2], argv[3]);
+    if (argv && argc >= 4 && !wcscmp(argv[1], L"--test")) return run_test(argv[2], argv[3], 0);
+    if (argv && argc >= 4 && !wcscmp(argv[1], L"--test-live")) return run_test(argv[2], argv[3], 1);
 #ifdef TW_TEST
     if (argv && argc >= 3 && !wcscmp(argv[1], L"--unit")) return run_unit(argv[2]);
+    if (argv && argc >= 5 && !wcscmp(argv[1], L"--trim")) return run_trim(argv[2], argv[3], argv[4]);
+    if (argv && argc >= 4 && !wcscmp(argv[1], L"--mic-vad")) return run_mic_vad(_wtoi(argv[2]), argv[3]);
 #endif
     if (argv && argc >= 3 && !wcscmp(argv[1], L"--watch"))
         return watch_main((HWND)(ULONG_PTR)_wcstoui64(argv[2], NULL, 10));
