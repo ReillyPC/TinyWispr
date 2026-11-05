@@ -53,8 +53,9 @@
 #define LIVE_SEND_BYTES BYTES_PER_SEC            /* most audio in one Realtime message */
 #define VAD_SAMPLES   (SAMPLE_RATE / 50)         /* 20 ms frames */
 #define VAD_MIN_ENERGY 3600.0f                   /* mean sample^2: RMS 60, below this is never speech */
-#define VAD_RATIO     4.0f                       /* a frame is voiced at 4x the noise energy (2x its RMS): errs toward keeping audio */
-#define VAD_RESUME_FRAMES 3                      /* 60 ms of voice ends a pause; a key click is shorter */
+#define VAD_RATIO     3.0f                       /* a frame is voiced at 3x the noise energy (+4.8 dB): soft speech 30 dB down still counts */
+#define VAD_HOLD_RATIO 1.5f                      /* once kept, audio at 1.5x the noise energy isn't a pause yet (soft consonants) */
+#define VAD_RESUME_FRAMES 3                     /* 60 ms of voice ends a pause; a key click is shorter */
 #define VAD_SPEECH_FRAMES 8                      /* 160 ms of voice means someone is talking */
 #define VAD_KEEP_FRAMES 35                       /* a pause keeps its first 700 ms... */
 #define VAD_PREROLL_FRAMES 10                    /* ...and its last 200 ms, so word onsets survive */
@@ -119,8 +120,8 @@ static const char DEFAULT_CONFIG[] =
 "[openai]\r\n"
 "; Your OpenAI API key (or leave blank and set the OPENAI_API_KEY environment variable)\r\n"
 "api_key=\r\n"
-"; Speech-to-text model: gpt-4o-mini-transcribe (fast, cheap), gpt-4o-transcribe (most accurate), whisper-1\r\n"
-"transcribe_model=gpt-4o-mini-transcribe\r\n"
+"; Speech-to-text model: gpt-transcribe, or gpt-live-transcribe (fastest, about 4x the price)\r\n"
+"transcribe_model=gpt-transcribe\r\n"
 "; Optional language code such as en. Blank = auto-detect.\r\n"
 "language=\r\n"
 "; 1 = stream audio to OpenAI while you talk (faster), 0 = upload it only when you finish\r\n"
@@ -382,7 +383,7 @@ static void load_cfg(Cfg *c)
         if (GetEnvironmentVariableW(L"OPENAI_API_KEY", w, 256))
             WideCharToMultiByte(CP_UTF8, 0, w, -1, c->key, sizeof c->key, NULL, NULL);
     }
-    ini_get(L"openai", L"transcribe_model", L"gpt-4o-mini-transcribe", c->tmodel, sizeof c->tmodel);
+    ini_get(L"openai", L"transcribe_model", L"gpt-transcribe", c->tmodel, sizeof c->tmodel);
     ini_get(L"openai", L"language", L"", c->lang, sizeof c->lang);
     ini_get(L"openai", L"streaming", L"1", tmp, sizeof tmp);
     c->streaming = tmp[0] != '0';
@@ -2451,7 +2452,7 @@ static void rec_frame(const short *s)
     if (R.floor < 0) R.floor = e;
     float thresh = R.floor * VAD_RATIO;
     if (thresh < VAD_MIN_ENERGY) thresh = VAD_MIN_ENERGY;
-    int voiced = e >= thresh;
+    int voiced = e >= thresh, held = voiced || e >= R.floor * VAD_HOLD_RATIO;
     if (voiced) R.floor = R.floor * 1.004f + 0.01f;
     else R.floor += (e < R.floor * 0.25f ? 0.3f : 0.05f) * (e - R.floor);
     if (voiced) { if (R.run < VAD_SPEECH_FRAMES) R.run++; }
@@ -2461,7 +2462,7 @@ static void rec_frame(const short *s)
         rec_keep(s, bytes);
     } else if (R.keeping) {
         rec_keep(s, bytes);
-        R.quiet = voiced ? 0 : R.quiet + 1;
+        R.quiet = held ? 0 : R.quiet + 1;
         if (R.quiet >= VAD_KEEP_FRAMES) { R.keeping = 0; R.preN = R.preNext = R.run = 0; }
     } else {
         memcpy(R.pre[R.preNext], s, bytes);
@@ -2947,6 +2948,11 @@ static void init_paths(void)
     write_file_if_missing(g_cfgPath, DEFAULT_CONFIG);
     write_file_if_missing(g_promptPath, DEFAULT_PROMPT);
     write_file_if_missing(g_dictPath, DEFAULT_DICTIONARY);
+    /* The old default leaves the API on Feb 26, 2027 and isn't documented for Realtime. */
+    wchar_t m[64];
+    GetPrivateProfileStringW(L"openai", L"transcribe_model", L"", m, 64, g_cfgPath);
+    if (!wcscmp(m, L"gpt-4o-mini-transcribe"))
+        WritePrivateProfileStringW(L"openai", L"transcribe_model", L"gpt-transcribe", g_cfgPath);
 }
 
 /* tinywispr.exe --test in.wav out.txt : run one clip through the pipeline and write the result.

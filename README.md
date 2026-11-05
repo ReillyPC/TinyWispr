@@ -2,7 +2,7 @@
 
 # TinyWispr
 
-Push-to-talk dictation for Windows in one 115 KB native executable. It's a minimal take on
+Push-to-talk dictation for Windows in one 118 KB native executable. It's a minimal take on
 [OpenWhispr](https://github.com/OpenWhispr/openwhispr) that does only the parts I use.
 
 | Keys | What happens |
@@ -97,9 +97,11 @@ Everything lives in `%APPDATA%\TinyWispr`. Changes apply on the next dictation; 
 - `prompt.txt`: the cleanup prompt.
 - `history.txt`: every dictation, one per line, with a timestamp.
 
-Defaults: `gpt-4o-mini-transcribe` for speech to text and `gpt-5.4-mini` (reasoning off) for
-cleanup. An 18-second clip typically comes back about 1.5 seconds after you let go. If cleanup
-fails, the raw transcript is pasted and a tray notification says why.
+Defaults: `gpt-transcribe` for speech to text and `gpt-5.4-mini` (reasoning off) for cleanup. An
+18-second clip typically comes back about 1.5 seconds after you let go. If cleanup fails, the raw
+transcript is pasted and a tray notification says why. `gpt-live-transcribe` cuts about half a
+second more, at about four times the price. A config that still names `gpt-4o-mini-transcribe`
+(the old default, which leaves the API on Feb 26, 2027) is moved to `gpt-transcribe` on start.
 
 ## Speed
 
@@ -124,8 +126,10 @@ someone talking:
 - Long pauses shrink to under a second: each keeps its first 700 ms and last 200 ms. OpenAI bills
   for silence too, so this lowers the cost. Set `[openai] trim_pauses=0` to send pauses as recorded.
 
-The detector can't tell your voice from other voices, so someone talking nearby can still start a
-stream during a longer press.
+The detector hears speech down to about 30 dB below normal talking volume in a quiet office. Once
+it's keeping audio, quiet consonants hold a stretch open, so soft words aren't clipped as pauses.
+Quieter than that, the dictation is dropped. It can't tell your voice from other voices, so
+someone talking nearby can still start a stream during a longer press.
 
 ## Testing
 
