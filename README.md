@@ -2,7 +2,7 @@
 
 # TinyWispr
 
-Push-to-talk dictation for Windows in one 110 KB native executable. It's a minimal take on
+Push-to-talk dictation for Windows in one 115 KB native executable. It's a minimal take on
 [OpenWhispr](https://github.com/OpenWhispr/openwhispr) that does only the parts I use.
 
 | Keys | What happens |
@@ -90,20 +90,51 @@ launches it. The tray icon (blue = idle, red = recording, amber = transcribing) 
 
 Everything lives in `%APPDATA%\TinyWispr`. Changes apply on the next dictation; no restart needed.
 
-- `config.ini`: API key, models, language, `tap_ms`, and `auto_learn`. Set `[cleanup] enabled=0`
-  to paste the raw transcript.
+- `config.ini`: API key, models, language, `streaming`, `trim_pauses`, `tap_ms`, and `auto_learn`. Set
+  `[cleanup] enabled=0` to paste the raw transcript.
 - `dictionary.txt`: your word list (newest entries last; the newest 800 characters go to the
   transcriber, up to 6,000 to cleanup).
 - `prompt.txt`: the cleanup prompt.
 - `history.txt`: every dictation, one per line, with a timestamp.
 
 Defaults: `gpt-4o-mini-transcribe` for speech to text and `gpt-5.4-mini` (reasoning off) for
-cleanup. An 18-second clip typically comes back in 2–3 seconds. If cleanup fails, the raw
-transcript is pasted and a tray notification says why.
+cleanup. An 18-second clip typically comes back about 1.5 seconds after you let go. If cleanup
+fails, the raw transcript is pasted and a tray notification says why.
+
+## Speed
+
+Audio streams to OpenAI's Realtime API while you talk, so little is left to do when you let go.
+An HTTPS connection is also warmed for the cleanup request, which keeps it from paying for a
+handshake. The recording stays in memory too: if the stream fails, the clip is uploaded the normal
+way. All of this exists only for the length of a dictation.
+
+Because audio leaves as you speak, a recording you cancel or throw away has already been sent, in
+part or in full. Set `[openai] streaming=0` to send audio only after you finish, which is about
+0.7 seconds slower on an 18-second clip.
+
+## What gets sent
+
+A small speech detector runs on the audio locally, and nothing reaches OpenAI until it hears
+someone talking:
+
+- A press under 650 ms is never sent, whatever is in it. There's no connection and no audio.
+- A longer press with only room noise or key clicks isn't sent either. If it lasted a second or
+  more, a pill says "Didn't hear anything".
+- Hands-free mode opens no connection until you start talking.
+- Long pauses shrink to under a second: each keeps its first 700 ms and last 200 ms. OpenAI bills
+  for silence too, so this lowers the cost. Set `[openai] trim_pauses=0` to send pauses as recorded.
+
+The detector can't tell your voice from other voices, so someone talking nearby can still start a
+stream during a longer press.
 
 ## Testing
 
 `build.ps1 -Test` also builds `tinywispr-test.exe`. That build accepts simulated key presses, and
-setting `TW_FAKE=<text>` skips OpenAI. `tinywispr.exe --test in.wav out.txt` runs one 16 kHz mono
-WAV through the real pipeline and writes the raw transcript, the cleaned text and the timing.
-`tinywispr-test.exe --unit out.txt` checks the correction learner and the echo filter.
+setting `TW_FAKE=<text>` skips OpenAI. `tinywispr.exe --test in.wav out.txt` runs one WAV through
+the real pipeline and writes the raw transcript, the cleaned text and the timing. `--test-live`
+does the same with a 24 kHz mono WAV, streaming it in real time first and timing from the end of
+the clip. `tinywispr-test.exe --unit out.txt` checks the correction learner and the echo filter.
+In the test build, `TW_LIVE_BREAK`, `TW_LIVE_MODEL=<bad model>`, `TW_LIVE_TIMEOUT` and
+`TW_LIVE_CANCEL` force each way the stream can fail. `--trim in.wav out.wav stats.txt` runs a clip
+through the speech detector offline, and `--mic-vad seconds stats.txt` runs it on the live
+microphone, keeping the audio in memory only and reporting numbers.
