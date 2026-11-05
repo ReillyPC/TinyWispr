@@ -14,7 +14,8 @@ Push-to-talk dictation for Windows in one 124 KB native executable. It's a minim
 A tap is a press shorter than 350 ms (`[hotkey] tap_ms`). During a hold, Ctrl + Win + any other key
 (for example Ctrl+Win+Left to switch desktops) cancels the recording. During hands-free, those
 shortcuts pass through and recording carries on, and Ctrl + Win + Alt throws the recording away.
-The Start menu doesn't open. After pasting, whatever was on your clipboard before (text, files,
+The Start menu doesn't open, even if you hold the keys a long time or your finger
+catches Win again within 150 ms of letting go. After pasting, whatever was on your clipboard before (text, files,
 images) is put back one second later.
 
 ## Dictionary

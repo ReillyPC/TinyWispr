@@ -45,6 +45,7 @@
 #define RESTORE_MS    1000                       /* restore the clipboard this long after pasting */
 #define HIST_N        5
 #define TAP_MS_DEFAULT 350                       /* Ctrl+Win released sooner than this = tap = hands-free */
+#define WIN_GRACE_MS  150                        /* a lone Win press this soon after Ctrl+Win won't open Start */
 #define WATCH_MS      30000                      /* how long to watch the field after a paste */
 #define WATCH_POLL_MS 250
 #define DICT_PROMPT_CHARS 800                    /* dictionary words sent to the transcriber */
@@ -2983,6 +2984,8 @@ static void rec_tick(void)
 static BYTE g_keyDown[256], g_swallowed[256];
 static DWORD g_chordTime;        /* when Ctrl+Win went down (hook clock) */
 static int g_chordWasLocked;     /* this hold is the tap that ends a hands-free recording */
+static int g_maskWin;            /* keep the Start menu shut until this Win press is released */
+static DWORD g_maskEnd;          /* when the last masked Win press (or the Ctrl after it) came up */
 
 static void send_mask_key(void)
 {
@@ -3018,6 +3021,12 @@ static LRESULT CALLBACK ll_proc(int code, WPARAM wp, LPARAM lp)
     if (isDown) {
         int wasDown = g_keyDown[vk];
         g_keyDown[vk] = 1;
+        if (isWin) {
+            /* A lone Win press right after Ctrl+Win (a sloppy or bouncing release) is masked like the
+               chord. So is every auto-repeat of a held Win: a repeat re-arms the Start menu. */
+            if (!wasDown && !g_maskWin && k->time - g_maskEnd < WIN_GRACE_MS) g_maskWin = 1;
+            if (g_maskWin) send_mask_key();
+        }
         if (mode == M_IDLE) {
             if (!wasDown && (isCtrl || isWin || isAlt)) {
                 int c = isCtrl || down(VK_LCONTROL);
@@ -3025,6 +3034,7 @@ static LRESULT CALLBACK ll_proc(int code, WPARAM wp, LPARAM lp)
                 int a = isAlt || down(VK_MENU);
                 if (c && w) {
                     send_mask_key();
+                    g_maskWin = 1;
                     g_chordTime = k->time;
                     g_chordWasLocked = 0;
                     InterlockedExchange(&g_mode, a ? M_HIST : M_REC);
@@ -3039,6 +3049,7 @@ static LRESULT CALLBACK ll_proc(int code, WPARAM wp, LPARAM lp)
                 int a = isAlt || down(VK_MENU);
                 if (c && w) {
                     send_mask_key();
+                    g_maskWin = 1;
                     if (a) {                         /* Ctrl+Win+Alt: discard, show history */
                         InterlockedExchange(&g_mode, M_HIST);
                         PostMessageW(g_main, WM_REC_STOP, 0, 0);
@@ -3085,6 +3096,12 @@ static LRESULT CALLBACK ll_proc(int code, WPARAM wp, LPARAM lp)
         }
     } else {
         g_keyDown[vk] = 0;
+        if (isWin && g_maskWin) {
+            send_mask_key();
+            if (!g_keyDown[VK_LWIN] && !g_keyDown[VK_RWIN]) { g_maskWin = 0; g_maskEnd = k->time; }
+        } else if (isCtrl && !g_maskWin && k->time - g_maskEnd < WIN_GRACE_MS) {
+            g_maskEnd = k->time;                     /* Win came up first: the grace starts at the last key */
+        }
         if (g_swallowed[vk]) { g_swallowed[vk] = 0; return 1; }
         if (mode == M_REC && (isCtrl || isWin)) {
             if (!g_chordWasLocked && k->time - g_chordTime < (DWORD)g_tapMs) {
