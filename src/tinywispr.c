@@ -6,6 +6,7 @@
  *                                           release to copy the highlighted one.
  *   dictionary.txt                       -> spellings for the transcriber and cleanup;
  *                                           words you fix right after a paste are learned.
+ *   %LOCALAPPDATA%\TinyWispr\log           -> every dictation's audio, transcript and output.
  *
  * Plain Win32 + WinHTTP + waveIn. No runtime, no browser engine, no polling:
  * when idle the process is two threads blocked in GetMessage. Learning from
@@ -145,7 +146,15 @@ static const char DEFAULT_CONFIG[] =
 "\r\n"
 "[dictionary]\r\n"
 "; Words live in dictionary.txt. 1 = learn words you correct within 30 s of a paste.\r\n"
-"auto_learn=1\r\n";
+"auto_learn=1\r\n"
+"\r\n"
+"[log]\r\n"
+"; 1 = keep every dictation on this computer (inputs and outputs) for testing prompts later\r\n"
+"enabled=1\r\n"
+"; 1 = also keep the audio as sent, as WAV (about 2.9 MB per minute of speech)\r\n"
+"audio=1\r\n"
+"; Blank = %LOCALAPPDATA%\\TinyWispr\\log\r\n"
+"folder=\r\n";
 
 static const char DEFAULT_DICTIONARY[] =
 "# TinyWispr dictionary: one word or name per line. Lines starting with # are ignored.\r\n"
@@ -416,19 +425,28 @@ static char *load_prompt(const char *agent)
 /* -------------------------------------------------------------- dictionary */
 
 /* dictionary.txt: one entry per line, lines starting with # are comments, and an entry
-   may end with "  # learned" (added automatically when a correction is learned). */
-typedef struct { char **w; unsigned char *learned; int n; char *buf; } DictList;
+   may end with "  # learned" (added automatically when a correction is learned) or
+   "  # misheard as shepherd" (what the transcriber tends to write instead; told to cleanup). */
+typedef struct { char **w, **heard; unsigned char *learned; int n; char *buf; } DictList;
 
-static int dict_parse_line(char *p, int *learned)
+static int dict_parse_line(char *p, int *learned, char **heard)
 {
     trim_inplace(p);
     *learned = 0;
+    if (heard) *heard = NULL;
     if (!*p || *p == '#') return 0;
     char *hash = strstr(p, " #");
     if (hash) {
         *learned = strstr(hash, "learned") != NULL;
+        char *m = strstr(hash, "misheard as");
         *hash = 0;
         trim_inplace(p);
+        if (m && heard) {
+            m += 11;
+            while (*m == ' ' || *m == ':') m++;
+            trim_inplace(m);
+            if (*m) *heard = m;
+        }
     }
     return *p != 0;
 }
@@ -445,13 +463,16 @@ static void dict_load(DictList *d)
         char *nl = strchr(p, '\n');
         if (nl) *nl = 0;
         int learned;
-        if (dict_parse_line(p, &learned)) {
+        char *heard;
+        if (dict_parse_line(p, &learned, &heard)) {
             if (d->n == cap) {
                 cap = cap ? cap * 2 : 64;
                 d->w = (char **)realloc(d->w, cap * sizeof(char *));
+                d->heard = (char **)realloc(d->heard, cap * sizeof(char *));
                 d->learned = (unsigned char *)realloc(d->learned, cap);
             }
             d->w[d->n] = p;
+            d->heard[d->n] = heard;
             d->learned[d->n] = (unsigned char)learned;
             d->n++;
         }
@@ -463,6 +484,7 @@ static void dict_load(DictList *d)
 static void dict_free(DictList *d)
 {
     free(d->w);
+    free(d->heard);
     free(d->learned);
     free(d->buf);
     memset(d, 0, sizeof *d);
@@ -499,6 +521,23 @@ static char *dict_joined(size_t maxChars)
     return s.p;
 }
 
+/* Lines for the cleanup prompt about entries marked "misheard as", or NULL if there are none. */
+static char *dict_misheard(void)
+{
+    DictList d;
+    dict_load(&d);
+    Sb s = {0};
+    for (int i = 0; i < d.n; i++) {
+        if (!d.heard[i]) continue;
+        sb_str(&s, "\n- \"");
+        sb_str(&s, d.w[i]);
+        sb_str(&s, "\" is often misheard as: ");
+        sb_str(&s, d.heard[i]);
+    }
+    dict_free(&d);
+    return s.p;
+}
+
 static void dict_write_all(const char *data, size_t len)
 {
     wchar_t tmp[MAX_PATH];
@@ -528,7 +567,7 @@ static int dict_remove(const char *word)
         line[l] = 0;
         int learned;
         char *probe = _strdup(line);
-        if (dict_parse_line(probe, &learned) && !_stricmp(probe, word)) removed++;
+        if (dict_parse_line(probe, &learned, NULL) && !_stricmp(probe, word)) removed++;
         else sb_add(&out, line, l);
         free(probe);
         free(line);
@@ -600,7 +639,7 @@ static char *dict_add_words(const char *list, int learned)
     char *copy = _strdup(list);
     for (char *w = strtok(copy, "\n"); w; w = strtok(NULL, "\n")) {
         int dummy;
-        if (!dict_parse_line(w, &dummy) || strlen(w) > 100) continue;
+        if (!dict_parse_line(w, &dummy, NULL) || strlen(w) > 100) continue;
         if (dict_find(&d, w) >= 0) continue;
         int dup = 0;   /* repeats within this batch */
         for (char *q = shown.p; q && *q && !dup;) {
@@ -968,19 +1007,150 @@ typedef struct {
     DWORD len;
     Live *live;          /* the stream for this recording, or NULL (owned by the job) */
     char *text;          /* final text to paste (malloc'd, may be empty) */
-    char *raw;           /* raw transcript, for --test */
+    char *raw;           /* raw transcript, for --test and the log */
     wchar_t err[256];
     ULONGLONG msStt, msClean;
-    int usedLive;
+    int usedLive, echo;
     char usage[256];
+    int log, trimmed;    /* log this dictation (real ones only, not --test); pauses were trimmed */
+    wchar_t logDir[MAX_PATH];
+    char logId[32], logTime[24], logAudio[64];
 } Job;
+
+/* ------------------------------------------------------------------- log */
+/*
+ * With [log] enabled=1 (the default), every dictation that reaches OpenAI is kept on this
+ * computer for testing prompts and training later. In the log folder (default
+ * %LOCALAPPDATA%\TinyWispr\log, so it never roams):
+ *   dictations.jsonl          one JSON line per dictation: the transcriber's input and output,
+ *                             the cleanup model's output, models, timings and status
+ *   audio\<date>\<time>.wav   the audio exactly as sent (24 kHz mono, pauses trimmed if on)
+ *   prompts\<hash>.txt        each distinct cleanup system prompt (with the dictionary), once
+ */
+
+static void mkdirs(const wchar_t *path)
+{
+    wchar_t p[MAX_PATH];
+    wcsncpy(p, path, MAX_PATH - 1);
+    p[MAX_PATH - 1] = 0;
+    for (wchar_t *q = p + 3; *q; q++)
+        if (*q == L'\\' || *q == L'/') { wchar_t c = *q; *q = 0; CreateDirectoryW(p, NULL); *q = c; }
+    CreateDirectoryW(p, NULL);
+}
+
+static void log_write(const wchar_t *dir, const char *rel, const void *data, DWORD n, DWORD disposition)
+{
+    wchar_t *wrel = to_wide(rel), path[MAX_PATH];
+    _snwprintf(path, MAX_PATH - 1, L"%ls\\%ls", dir, wrel);
+    path[MAX_PATH - 1] = 0;
+    free(wrel);
+    for (wchar_t *q = path; *q; q++) if (*q == L'/') *q = L'\\';
+    wchar_t *slash = wcsrchr(path, L'\\');
+    if (slash) { *slash = 0; mkdirs(path); *slash = L'\\'; }
+    int append = disposition == OPEN_ALWAYS;
+    HANDLE f = INVALID_HANDLE_VALUE;
+    for (int tries = 0; f == INVALID_HANDLE_VALUE && tries < 20; tries++) {   /* two jobs can finish together */
+        f = CreateFileW(path, append ? FILE_APPEND_DATA : GENERIC_WRITE, FILE_SHARE_READ, NULL, disposition, 0, NULL);
+        if (f == INVALID_HANDLE_VALUE && GetLastError() != ERROR_SHARING_VIOLATION) return;
+        if (f == INVALID_HANDLE_VALUE) Sleep(10);
+    }
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD wr;
+    WriteFile(f, data, n, &wr, NULL);
+    CloseHandle(f);
+}
+
+/* Called before anything is sent: picks the log folder and keeps the audio. */
+/* The log folder (created), or 0 if logging is off. */
+static int log_folder(wchar_t *out)
+{
+    if (!GetPrivateProfileIntW(L"log", L"enabled", 1, g_cfgPath)) return 0;
+    wchar_t w[MAX_PATH];
+    GetPrivateProfileStringW(L"log", L"folder", L"", w, MAX_PATH, g_cfgPath);
+    if (w[0]) ExpandEnvironmentStringsW(w, out, MAX_PATH);
+    else if (GetEnvironmentVariableW(L"LOCALAPPDATA", w, MAX_PATH)) _snwprintf(out, MAX_PATH - 1, L"%ls\\TinyWispr\\log", w);
+    else return 0;
+    out[MAX_PATH - 1] = 0;
+    mkdirs(out);
+    return 1;
+}
+
+static void log_begin(Job *j)
+{
+    if (!log_folder(j->logDir)) { j->log = 0; return; }
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    snprintf(j->logId, sizeof j->logId, "%04d%02d%02d-%02d%02d%02d-%03d", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+    snprintf(j->logTime, sizeof j->logTime, "%04d-%02d-%02d %02d:%02d:%02d", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    if (j->wav && j->len > WAV_HDR && GetPrivateProfileIntW(L"log", L"audio", 1, g_cfgPath)) {
+        snprintf(j->logAudio, sizeof j->logAudio, "audio/%04d-%02d-%02d/%s.wav", t.wYear, t.wMonth, t.wDay, j->logId + 9);
+        log_write(j->logDir, j->logAudio, j->wav, j->len, CREATE_ALWAYS);
+    }
+}
+
+static void log_field(Sb *s, const char *k, const char *v)
+{
+    sb_str(s, ",\"");
+    sb_str(s, k);
+    sb_str(s, "\":");
+    if (v) sb_json(s, v);
+    else sb_str(s, "null");
+}
+
+static void log_end(Job *j, const Cfg *c, const char *sttPrompt, const char *cleanPrompt)
+{
+    char num[96], promptRel[40] = "";
+    if (cleanPrompt) {
+        unsigned long long h = 14695981039346656037ULL;   /* FNV-1a */
+        for (const unsigned char *p = (const unsigned char *)cleanPrompt; *p; p++) h = (h ^ *p) * 1099511628211ULL;
+        snprintf(promptRel, sizeof promptRel, "prompts/%016llx.txt", h);
+        log_write(j->logDir, promptRel, cleanPrompt, (DWORD)strlen(cleanPrompt), CREATE_NEW);
+    }
+    char err[512] = "";
+    if (j->err[0]) WideCharToMultiByte(CP_UTF8, 0, j->err, -1, err, sizeof err, NULL, NULL);
+    const char *status = !j->raw ? (j->err[0] ? "error" : "empty") : j->echo ? "dropped_echo"
+                         : j->err[0] ? "cleanup_failed" : "ok";
+    Sb s = {0};
+    sb_str(&s, "{\"id\":");
+    sb_json(&s, j->logId);
+    log_field(&s, "time", j->logTime);
+    log_field(&s, "status", status);
+    log_field(&s, "audio", j->logAudio[0] ? j->logAudio : NULL);
+    snprintf(num, sizeof num, ",\"audio_ms\":%lu,\"pauses_trimmed\":%s", (unsigned long)((j->len > WAV_HDR ? j->len - WAV_HDR : 0) / (BYTES_PER_SEC / 1000)),
+             j->trimmed ? "true" : "false");
+    sb_str(&s, num);
+    log_field(&s, "transcribe_model", c->tmodel);
+    log_field(&s, "transcribe_via", j->usedLive ? "realtime" : "upload");
+    log_field(&s, "language", c->lang[0] ? c->lang : NULL);
+    log_field(&s, "transcribe_prompt", sttPrompt);
+    log_field(&s, "raw", j->raw);
+    log_field(&s, "cleanup_model", c->cleanup ? c->cmodel : NULL);
+    log_field(&s, "reasoning_effort", c->cleanup && c->effort[0] ? c->effort : NULL);
+    log_field(&s, "cleanup_prompt", promptRel[0] ? promptRel : NULL);
+    log_field(&s, "text", j->echo ? NULL : j->text);
+    log_field(&s, "error", err[0] ? err : NULL);
+    snprintf(num, sizeof num, ",\"ms_transcribe\":%llu,\"ms_cleanup\":%llu}\n", (unsigned long long)j->msStt, (unsigned long long)j->msClean);
+    sb_str(&s, num);
+    log_write(j->logDir, "dictations.jsonl", s.p, (DWORD)s.n, OPEN_ALWAYS);
+    free(s.p);
+}
 
 static void run_job(Job *j)
 {
 #ifdef TW_TEST
     { /* test builds: TW_FAKE=<text> skips the network */
         static char fake[1024];
-        if (GetEnvironmentVariableA("TW_FAKE", fake, sizeof fake)) { j->text = _strdup(fake); return; }
+        if (GetEnvironmentVariableA("TW_FAKE", fake, sizeof fake)) {
+            j->text = _strdup(fake);
+            if (j->log && GetEnvironmentVariableA("TW_LOG", NULL, 0)) {   /* log it, so the watcher logs the edit */
+                Cfg c;
+                load_cfg(&c);
+                log_begin(j);
+                j->raw = _strdup(fake);
+                if (j->log) log_end(j, &c, NULL, NULL);
+            }
+            return;
+        }
     }
 #endif
     Cfg c;
@@ -999,8 +1169,9 @@ static void run_job(Job *j)
         if (!ses) { wcscpy(j->err, L"Could not start WinHTTP"); return; }
         con = WinHttpConnect(ses, L"api.openai.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
     }
-    char *resp = NULL, *raw = NULL;
+    char *resp = NULL, *raw = NULL, *cleanPrompt = NULL;
     DWORD st;
+    if (j->log) log_begin(j);
 
     /* 1. Speech to text */
     ULONGLONG t0 = now_ms();
@@ -1048,8 +1219,8 @@ static void run_job(Job *j)
     j->msStt = now_ms() - t0;
     trim_inplace(raw);
     if (!raw || !raw[0]) goto done;
-    if (dictPrompt && is_dictionary_echo(raw, dictPrompt)) goto done;   /* model recited the word list */
     j->raw = _strdup(raw);
+    if (dictPrompt && is_dictionary_echo(raw, dictPrompt)) { j->echo = 1; goto done; }   /* model recited the word list */
 
     /* 2. Cleanup */
     if (c.cleanup) {
@@ -1060,6 +1231,13 @@ static void run_job(Job *j)
             sb_str(&ps, prompt);
             sb_str(&ps, "\n\nCustom Dictionary (use these exact spellings when they appear in the text): ");
             sb_str(&ps, dictAll);
+            char *heard = dict_misheard();
+            if (heard) {
+                sb_str(&ps, "\n\nOften misheard: the transcriber tends to write the misheard words when the speaker said the "
+                            "dictionary term. Where one appears and the dictionary term fits the context, write the term instead.");
+                sb_str(&ps, heard);
+                free(heard);
+            }
             free(prompt);
             free(dictAll);
             prompt = ps.p;
@@ -1079,7 +1257,7 @@ static void run_job(Job *j)
         if (!reasoning) sb_str(&js, ",\"temperature\":0");
         if (reasoning && c.effort[0]) { sb_str(&js, ",\"reasoning_effort\":"); sb_json(&js, c.effort); }
         sb_str(&js, "}");
-        free(prompt);
+        cleanPrompt = prompt;
         free(user.p);
         t0 = now_ms();
         resp = http_post(con, L"/v1/chat/completions", c.key, "application/json", js.p, (DWORD)js.n, &st);
@@ -1100,7 +1278,9 @@ static void run_job(Job *j)
     if (!j->text) { j->text = raw; raw = NULL; }
 
 done:
+    if (j->log) log_end(j, &c, dictPrompt, cleanPrompt);
     free(dictPrompt);
+    free(cleanPrompt);
     free(resp);
     free(raw);
     if (j->live) {
@@ -1117,7 +1297,8 @@ static DWORD WINAPI job_thread(LPVOID p)
     Job *j = (Job *)p;
     run_job(j);
     if (j->err[0]) PostMessageW(g_main, WM_JOB_ERROR, 0, (LPARAM)_wcsdup(j->err));
-    PostMessageW(g_main, WM_JOB_DONE, 0, (LPARAM)j->text);
+    /* wParam: the log id (malloc'd) so the watcher can log what the user fixed, or 0 */
+    PostMessageW(g_main, WM_JOB_DONE, (WPARAM)(j->log && j->logId[0] ? _strdup(j->logId) : NULL), (LPARAM)j->text);
     free(j->wav);
     free(j->raw);
     free(j);
@@ -1626,7 +1807,79 @@ out:
     return found;
 }
 
-/* ---- watcher child process: tinywispr.exe --watch <hwnd>, pasted text on stdin ---- */
+/* ---- the corrected text, for the dictation log ----
+   Once the paste is found in the field, the text before and after it is fixed. Any later state
+   that keeps both has the paste, as the user edited it, in between. A state that doesn't (the
+   message was sent, the box cleared or rewritten) ends the tracking. */
+
+typedef struct { wchar_t *field0; size_t pre, post; } Frame;
+
+static void strip_cr(wchar_t *s)
+{
+    wchar_t *d = s;
+    for (; *s; s++) if (*s != L'\r') *d++ = *s;
+    *d = 0;
+}
+
+static int frame_find(Frame *fr, const wchar_t *field, const wchar_t *orig)
+{
+    const wchar_t *p = wcsstr(field, orig);
+    if (!p || !orig[0]) return 0;
+    fr->field0 = _wcsdup(field);
+    fr->pre = (size_t)(p - field);
+    fr->post = wcslen(field) - fr->pre - wcslen(orig);
+    return 1;
+}
+
+/* The paste's span in `now` (malloc'd), or NULL if the text around it changed or it's empty. */
+static wchar_t *frame_span(const Frame *fr, const wchar_t *now)
+{
+    size_t n = wcslen(now), n0 = wcslen(fr->field0);
+    if (n <= fr->pre + fr->post || wcsncmp(now, fr->field0, fr->pre) ||
+        wcscmp(now + n - fr->post, fr->field0 + n0 - fr->post)) return NULL;
+    size_t len = n - fr->pre - fr->post;
+    wchar_t *s = (wchar_t *)malloc((len + 1) * sizeof(wchar_t));
+    memcpy(s, now + fr->pre, len * sizeof(wchar_t));
+    s[len] = 0;
+    return s;
+}
+
+static void sb_json_w(Sb *s, const wchar_t *w)
+{
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    char *u = (char *)malloc(n > 0 ? n : 1);
+    u[0] = 0;
+    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w, -1, u, n, NULL, NULL);
+    sb_json(s, u);
+    free(u);
+}
+
+/* Appends {"id","time","app","edited","pasted","corrected"} to corrections.jsonl. */
+static void log_correction(const char *id, const wchar_t *app, const wchar_t *pasted, const wchar_t *corrected)
+{
+    wchar_t dir[MAX_PATH];
+    if (!log_folder(dir)) return;
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    char when[24];
+    snprintf(when, sizeof when, "%04d-%02d-%02d %02d:%02d:%02d", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    Sb s = {0};
+    sb_str(&s, "{\"id\":");
+    sb_json(&s, id);
+    sb_str(&s, ",\"time\":");
+    sb_json(&s, when);
+    sb_str(&s, ",\"app\":");
+    sb_json_w(&s, app);
+    sb_str(&s, wcscmp(pasted, corrected) ? ",\"edited\":true,\"pasted\":" : ",\"edited\":false,\"pasted\":");
+    sb_json_w(&s, pasted);
+    sb_str(&s, ",\"corrected\":");
+    sb_json_w(&s, corrected);
+    sb_str(&s, "}\n");
+    log_write(dir, "corrections.jsonl", s.p, (DWORD)s.n, OPEN_ALWAYS);
+    free(s.p);
+}
+
+/* ---- watcher child process: tinywispr.exe --watch <hwnd> <learn> <log id>, pasted text on stdin ---- */
 
 typedef HRESULT (WINAPI *PFN_CoInitializeEx)(LPVOID, DWORD);
 typedef HRESULT (WINAPI *PFN_CoCreateInstance)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID *);
@@ -1656,18 +1909,25 @@ static wchar_t *field_read(FieldSrc *s)
     if (!b) return NULL;
     wchar_t *w = _wcsdup(b);
     pSysFreeString(b);
+    strip_cr(w);   /* fields differ on \r\n vs \n; compare without \r */
     return w;
 }
 
+static int g_watchLearn = 1;
+
 static void watch_send(HWND parent, Sb *words)
 {
-    if (!words->n) return;
+    if (!words->n || !g_watchLearn) return;
     COPYDATASTRUCT cds = {TW_COPYDATA_LEARNED, (DWORD)words->n + 1, words->p};
     SendMessageTimeoutW(parent, WM_COPYDATA, 0, (LPARAM)&cds, SMTO_ABORTIFHUNG, 3000, NULL);
 }
 
-static int watch_main(HWND parent)
+static int watch_main(HWND parent, int learn, const wchar_t *logIdW)
 {
+    g_watchLearn = learn;
+    char logId[40] = "";
+    if (logIdW) WideCharToMultiByte(CP_UTF8, 0, logIdW, -1, logId, sizeof logId, NULL, NULL);
+    logId[sizeof logId - 1] = 0;
     /* Original pasted text arrives on stdin. */
     HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
     Sb txt = {0};
@@ -1677,10 +1937,28 @@ static int watch_main(HWND parent)
     if (!txt.n) return 0;
     wchar_t *orig = to_wide(txt.p);
     free(txt.p);
+    strip_cr(orig);
 
     MSG msg;
     PeekMessageW(&msg, NULL, 0, 0, PM_NOREMOVE);   /* create the queue so the app can tell us to stop */
     Sleep(450);                                    /* let the paste land */
+
+    wchar_t app[MAX_PATH] = L"";                   /* the app pasted into, for the log */
+    {
+        DWORD pid = 0, n = MAX_PATH;
+        GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+        HANDLE ph = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : NULL;
+        if (ph) {
+            if (QueryFullProcessImageNameW(ph, 0, app, &n)) {
+                wchar_t *slash = wcsrchr(app, L'\\');
+                if (slash) memmove(app, slash + 1, (wcslen(slash + 1) + 1) * sizeof(wchar_t));
+            } else app[0] = 0;
+            CloseHandle(ph);
+        }
+    }
+    Frame fr = {0};
+    wchar_t *best = NULL, *cur = NULL;   /* the paste as edited: last settled state, and the latest one */
+    int tracking = logId[0] != 0;
 
     HMODULE ole = LoadLibraryW(L"ole32.dll"), oleaut = LoadLibraryW(L"oleaut32.dll");
     if (!ole || !oleaut) return 0;
@@ -1704,6 +1982,7 @@ static int watch_main(HWND parent)
     if (pwd) goto end;
     IUIAutomationElement_GetCurrentPatternAs(el, UIA_ValuePatternId, &kIID_ValuePattern, (void **)&src.vp);
     IUIAutomationElement_GetCurrentPatternAs(el, UIA_TextPatternId, &kIID_TextPattern, (void **)&src.tp);
+    dbg("watch: start learn=%d log=%s app=%ls patterns=%d%d", learn, logId[0] ? logId : "-", app, src.vp != NULL, src.tp != NULL);
     if (!src.vp && !src.tp) goto end;
     last = field_read(&src);
     if (!last || wcslen(last) > 20000) goto end;   /* unreadable field, or a whole document */
@@ -1712,12 +1991,14 @@ static int watch_main(HWND parent)
     ULONGLONG t0 = now_ms(), candT = 0, changedT = t0;
     int stop = 0, failures = 0;
     if (extract_corrections(orig, last, &cand)) candT = t0;   /* already edited before our first look */
+    if (tracking && frame_find(&fr, last, orig)) { best = _wcsdup(orig); cur = _wcsdup(orig); }
     while (!stop && now_ms() - t0 < WATCH_MS) {
         MsgWaitForMultipleObjects(0, NULL, FALSE, WATCH_POLL_MS, QS_ALLPOSTMESSAGE);
         while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) stop = 1;
             else DispatchMessageW(&msg);          /* COM's own window messages */
         }
+        if (stop) break;                          /* the next paste may already be in the field */
         wchar_t *v = field_read(&src);
         ULONGLONG t = now_ms();
 #ifdef TW_TEST
@@ -1732,6 +2013,20 @@ static int watch_main(HWND parent)
             if (++failures >= 3) stop = 1;
         } else if (wcscmp(v, last)) {
             failures = 0;
+            if (tracking && !fr.field0) {
+                if (frame_find(&fr, v, orig)) { best = _wcsdup(orig); cur = _wcsdup(orig); }   /* the paste landed late */
+            } else if (tracking) {
+                wchar_t *span = frame_span(&fr, v);
+                if (!span) {
+                    /* Sent, cleared or rewritten: the state just before is the final edit, unless the
+                       user was deleting the text (then keep the last settled state). */
+                    tracking = 0;
+                    if (cur && wcslen(cur) * 2 >= wcslen(best)) { free(best); best = cur; cur = NULL; }
+                } else {
+                    free(cur);
+                    cur = span;
+                }
+            }
             Sb words = {0};
             int n = extract_corrections(orig, v, &words);
             if (n) {
@@ -1751,6 +2046,10 @@ static int watch_main(HWND parent)
             changedT = t;
         } else {
             free(v);
+            if (tracking && cur && t - changedT >= 2 * WATCH_POLL_MS && wcscmp(cur, best)) {   /* settled */
+                free(best);
+                best = _wcsdup(cur);
+            }
             if (cand.n && t - changedT >= 1500) {   /* edit has settled */
                 watch_send(parent, &cand);
                 learned++;
@@ -1760,9 +2059,14 @@ static int watch_main(HWND parent)
         }
     }
     if (cand.n && now_ms() - candT >= 2 * WATCH_POLL_MS) { watch_send(parent, &cand); learned++; }
-    dbg("watch: done, learned %d batch(es)", learned);
+    if (tracking && cur && best && wcslen(cur) * 2 >= wcslen(best)) { free(best); best = cur; cur = NULL; }
+    if (best) log_correction(logId, app, orig, best);
+    dbg("watch: done, learned %d batch(es), logged %d", learned, best != NULL);
     (void)learned;
 end:
+    free(best);
+    free(cur);
+    free(fr.field0);
     free(cand.p);
     free(last);
     free(orig);
@@ -1788,18 +2092,21 @@ static void watch_stop(void)
     g_watchProc = NULL;
 }
 
-static void watch_start(const char *text)
+static void watch_start(const char *text, const char *id)
 {
     watch_stop();
-    if (!GetPrivateProfileIntW(L"dictionary", L"auto_learn", 1, g_cfgPath)) return;
+    int learn = GetPrivateProfileIntW(L"dictionary", L"auto_learn", 1, g_cfgPath) != 0;
+    int logIt = id && GetPrivateProfileIntW(L"log", L"enabled", 1, g_cfgPath);
+    if (!learn && !logIt) return;
     SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, TRUE};
     HANDLE r, w;
     if (!CreatePipe(&r, &w, &sa, 0)) return;
     SetHandleInformation(w, HANDLE_FLAG_INHERIT, 0);
-    wchar_t exe[MAX_PATH], cmd[MAX_PATH + 64];
+    wchar_t exe[MAX_PATH], cmd[MAX_PATH + 96];
     GetModuleFileNameW(NULL, exe, MAX_PATH);
-    _snwprintf(cmd, MAX_PATH + 63, L"\"%ls\" --watch %llu", exe, (unsigned long long)(ULONG_PTR)g_main);
-    cmd[MAX_PATH + 63] = 0;
+    _snwprintf(cmd, MAX_PATH + 95, L"\"%ls\" --watch %llu %d %hs", exe, (unsigned long long)(ULONG_PTR)g_main, learn,
+               logIt ? id : "-");
+    cmd[MAX_PATH + 95] = 0;
     STARTUPINFOW si = {sizeof si};
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdInput = r;
@@ -1817,7 +2124,7 @@ static void watch_start(const char *text)
 
 /* ------------------------------------------------------------------ paste */
 
-static char *g_pasteQ[16];
+static char *g_pasteQ[16], *g_pasteId[16];   /* text to paste, and its log id or NULL */
 static int g_pasteN;
 static ULONGLONG g_pasteSince;
 
@@ -1834,7 +2141,7 @@ static void send_ctrl_v(void)
     SendInput(4, in, sizeof(INPUT));
 }
 
-static void paste_now(const char *text)
+static void paste_now(const char *text, const char *id)
 {
 #ifdef TW_TEST   /* test builds only paste into the harness (TW_PASTE_PID), never into your other windows */
     {
@@ -1867,7 +2174,7 @@ static void paste_now(const char *text)
 #endif
     send_ctrl_v();
     SetTimer(g_main, T_RESTORE, RESTORE_MS, NULL);
-    watch_start(text);
+    watch_start(text, id);
 }
 
 static void paste_pump(void)
@@ -1881,19 +2188,23 @@ static void paste_pump(void)
             SetTimer(g_main, T_PASTE, 30, NULL);
             return;
         }
-        char *t = g_pasteQ[0];
-        memmove(&g_pasteQ[0], &g_pasteQ[1], (--g_pasteN) * sizeof g_pasteQ[0]);
-        paste_now(t);
+        char *t = g_pasteQ[0], *id = g_pasteId[0];
+        memmove(&g_pasteQ[0], &g_pasteQ[1], (g_pasteN - 1) * sizeof g_pasteQ[0]);
+        memmove(&g_pasteId[0], &g_pasteId[1], (g_pasteN - 1) * sizeof g_pasteId[0]);
+        g_pasteN--;
+        paste_now(t, id);
         free(t);
+        free(id);
         g_pasteSince = now_ms();
     }
     KillTimer(g_main, T_PASTE);
 }
 
-static void paste_enqueue(char *text)
+static void paste_enqueue(char *text, char *id)
 {
-    if (g_pasteN == 16) { free(text); return; }
+    if (g_pasteN == 16) { free(text); free(id); return; }
     if (!g_pasteN) g_pasteSince = now_ms();
+    g_pasteId[g_pasteN] = id;
     g_pasteQ[g_pasteN++] = text;
     paste_pump();
 }
@@ -2540,6 +2851,8 @@ static void start_job(BYTE *wav, DWORD len, Live *live)
     j->wav = wav;
     j->len = len;
     j->live = live;
+    j->log = 1;
+    j->trimmed = R.trim;
     HANDLE th = CreateThread(NULL, 0, job_thread, j, 0, NULL);
     if (!th) {
         if (live) live_cancel(live);
@@ -2894,10 +3207,10 @@ static LRESULT CALLBACK main_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_JOB_DONE: {
-        char *t = (char *)lp;
+        char *t = (char *)lp, *id = (char *)wp;
         if (g_jobs) g_jobs--;
-        if (t && t[0]) { history_add(t); paste_enqueue(t); }
-        else free(t);
+        if (t && t[0]) { history_add(t); paste_enqueue(t, id); }
+        else { free(t); free(id); }
         overlay_refresh();
         if (!g_jobs && !R.h) SetTimer(w, T_TRIM, 2000, NULL);
         return 0;
@@ -2986,8 +3299,12 @@ static int run_test(const wchar_t *in, const wchar_t *out, int stream)
 #endif
         free(wav);
         j.wav = NULL;
+        j.trimmed = R.trim;
         sent = rec_take(1, &j.wav, &j.len, &j.live);
     }
+#ifdef TW_TEST
+    j.log = GetEnvironmentVariableA("TW_LOG", NULL, 0) != 0;   /* exercise the dictation log */
+#endif
     ULONGLONG t0 = now_ms();
     if (sent) run_job(&j);
     ULONGLONG ms = now_ms() - t0;
@@ -3139,6 +3456,41 @@ static int run_unit(const wchar_t *out)
         snprintf(line, sizeof line, "%s echo #%d got=%d\n", ok ? "PASS" : "FAIL", (int)i, g);
         sb_str(&s, line);
     }
+    static const struct { const wchar_t *field0, *orig, *now, *expect; } F[] = {
+        {L"Ship it.", L"Ship it.", L"Ship it today.", L"Ship it today."},                         /* box holds only the paste */
+        {L"Hi Bob,\nlets shepherd\nThanks", L"lets shepherd", L"Hi Bob,\nlet's ship it\nThanks", L"let's ship it"},
+        {L"Hi Bob,\nlets shepherd\nThanks", L"lets shepherd", L"Hi Rob,\nlets shepherd\nThanks", NULL}, /* text around it changed */
+        {L"Ship it.", L"Ship it.", L"", NULL},                                                    /* sent or cleared */
+        {L"a Ship it. b", L"Ship it.", L"a  b", NULL},                                            /* paste deleted */
+    };
+    for (size_t i = 0; i < sizeof F / sizeof F[0]; i++) {
+        Frame fr = {0};
+        wchar_t *span = frame_find(&fr, F[i].field0, F[i].orig) ? frame_span(&fr, F[i].now) : NULL;
+        int ok = F[i].expect ? span && !wcscmp(span, F[i].expect) : !span;
+        fails += !ok;
+        char line[64];
+        snprintf(line, sizeof line, "%s frame #%d\n", ok ? "PASS" : "FAIL", (int)i);
+        sb_str(&s, line);
+        free(span);
+        free(fr.field0);
+    }
+    static const struct { const char *line, *word, *heard; int learned; } D[] = {
+        {"ship it  # misheard as shepherd", "ship it", "shepherd", 0},
+        {"ship it  # misheard as: shepherd, shipping", "ship it", "shepherd, shipping", 0},
+        {"Sinead  # learned", "Sinead", "", 1},
+        {"NDIL", "NDIL", "", 0},
+    };
+    for (size_t i = 0; i < sizeof D / sizeof D[0]; i++) {
+        char buf[128], *heard;
+        int learned;
+        snprintf(buf, sizeof buf, "%s", D[i].line);
+        int got = dict_parse_line(buf, &learned, &heard);
+        int ok = got && !strcmp(buf, D[i].word) && !strcmp(heard ? heard : "", D[i].heard) && learned == D[i].learned;
+        fails += !ok;
+        char line[256];
+        snprintf(line, sizeof line, "%s dict #%d word=[%s] heard=[%s]\n", ok ? "PASS" : "FAIL", (int)i, buf, heard ? heard : "");
+        sb_str(&s, line);
+    }
     /* What gets sent. Rates are in samples; every recording starts with room noise and a click. */
     {
         const DWORD MS = SAMPLE_RATE / 1000, N = 30000 * MS;
@@ -3210,8 +3562,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     if (argv && argc >= 5 && !wcscmp(argv[1], L"--trim")) return run_trim(argv[2], argv[3], argv[4]);
     if (argv && argc >= 4 && !wcscmp(argv[1], L"--mic-vad")) return run_mic_vad(_wtoi(argv[2]), argv[3]);
 #endif
-    if (argv && argc >= 3 && !wcscmp(argv[1], L"--watch"))
-        return watch_main((HWND)(ULONG_PTR)_wcstoui64(argv[2], NULL, 10));
+    if (argv && argc >= 3 && !wcscmp(argv[1], L"--watch"))   /* --watch <hwnd> [learn 0/1] [log id or -] */
+        return watch_main((HWND)(ULONG_PTR)_wcstoui64(argv[2], NULL, 10), argc >= 4 ? _wtoi(argv[3]) : 1,
+                          argc >= 5 && wcscmp(argv[4], L"-") ? argv[4] : NULL);
     LocalFree(argv);
 
 #ifdef TW_TEST   /* test builds may run next to the installed app */

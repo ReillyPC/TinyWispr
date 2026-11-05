@@ -2,7 +2,7 @@
 
 # TinyWispr
 
-Push-to-talk dictation for Windows in one 118 KB native executable. It's a minimal take on
+Push-to-talk dictation for Windows in one 124 KB native executable. It's a minimal take on
 [OpenWhispr](https://github.com/OpenWhispr/openwhispr) that does only the parts I use.
 
 | Keys | What happens |
@@ -24,6 +24,17 @@ spelling hint and appended to the cleanup prompt ("use these exact spellings"). 
 transcriber only recites the list back (which can happen on near-silence), the result is thrown
 away.
 
+**Words it mishears as other words.** If the transcriber keeps writing a real word in place of
+yours, add what it hears after `# misheard as`:
+
+```
+ship it  # misheard as shepherd
+```
+
+The cleanup prompt then gets a note that "ship it" is often misheard as "shepherd", and swaps it
+only where "ship it" fits ("so shepherd" becomes "so ship it"; "the shepherd walked his dog"
+stays). List several with commas: `# misheard as shepherd, shipped it`.
+
 **Learning from your edits.** For 30 seconds after a paste, TinyWispr watches the text box it
 pasted into. If you fix a misheard word (say *Shunade* to *Sinead*), the corrected word is added
 to the dictionary and a pill says "Added to dictionary: Sinead". A word only counts as a fix if:
@@ -35,7 +46,8 @@ to the dictionary and a pill says "Added to dictionary: Sinead". A word only cou
 
 This is the same rule OpenWhispr uses. It still learns if you fix the word and press Enter right
 away. Half-typed words are ignored. Learned words are tagged `# learned` in the file. Turn learning
-off with `[dictionary] auto_learn=0`.
+off with `[dictionary] auto_learn=0` (the watcher still runs to fill the
+[dictation log](#dictation-log) unless that's off too).
 
 **Editing.** Press Right in the Ctrl+Win+Alt popup (or use the tray menu → Edit dictionary) to open
 the dictionary window. It stays open after you let go:
@@ -90,7 +102,8 @@ launches it. The tray icon (blue = idle, red = recording, amber = transcribing) 
 
 Everything lives in `%APPDATA%\TinyWispr`. Changes apply on the next dictation; no restart needed.
 
-- `config.ini`: API key, models, language, `streaming`, `trim_pauses`, `tap_ms`, and `auto_learn`. Set
+- `config.ini`: API key, models, language, `streaming`, `trim_pauses`, `tap_ms`, `auto_learn`, and
+  the `[log]` settings. Set
   `[cleanup] enabled=0` to paste the raw transcript.
 - `dictionary.txt`: your word list (newest entries last; the newest 800 characters go to the
   transcriber, up to 6,000 to cleanup).
@@ -102,6 +115,31 @@ Defaults: `gpt-transcribe` for speech to text and `gpt-5.4-mini` (reasoning off)
 transcript is pasted and a tray notification says why. `gpt-live-transcribe` cuts about half a
 second more, at about four times the price. A config that still names `gpt-4o-mini-transcribe`
 (the old default, which leaves the API on Feb 26, 2027) is moved to `gpt-transcribe` on start.
+
+## Dictation log
+
+Every dictation that reaches OpenAI is also kept in `%LOCALAPPDATA%\TinyWispr\log`, which stays
+on this computer (it isn't in the roaming profile). It's there to test cleanup prompts against
+real dictations, and to train a voice model later.
+
+- `dictations.jsonl`: one JSON line per dictation with the id, time, status (`ok`, `empty`,
+  `dropped_echo`, `cleanup_failed`, `error`), audio path and length, transcribe model and the
+  word list sent with it, the raw transcript, cleanup model and effort, the cleanup prompt file,
+  the final text, any error, and timings.
+- `audio\<date>\<time>.wav`: the audio exactly as sent (24 kHz mono 16-bit, with long pauses
+  shortened if `trim_pauses` is on). About 2.9 MB per minute of speech.
+- `prompts\<hash>.txt`: each distinct cleanup system prompt, dictionary included, saved once.
+  A line's `cleanup_prompt` names the one it used.
+- `corrections.jsonl`: what you did with each paste in the 30 seconds after it, from the same
+  watcher that learns words. One line per dictation, matched by `id`: the app it went into,
+  `edited` (true or false), the text as pasted, and the text after your edits (taken just before
+  you sent the message or cleared the box). Not written when the field can't be read (see above)
+  or the app reformatted the paste (Word lists, for example).
+
+Presses that never reach OpenAI (short taps, no speech, cancelled recordings) aren't logged. In
+`config.ini`, `[log] enabled=0` turns the log off, `audio=0` keeps the text without the WAVs, and
+`folder=` moves it (environment variables work, such as `%USERPROFILE%\TinyWisprLog`). Nothing
+is ever deleted automatically.
 
 ## Speed
 
@@ -137,7 +175,9 @@ someone talking nearby can still start a stream during a longer press.
 setting `TW_FAKE=<text>` skips OpenAI. `tinywispr.exe --test in.wav out.txt` runs one WAV through
 the real pipeline and writes the raw transcript, the cleaned text and the timing. `--test-live`
 does the same with a 24 kHz mono WAV, streaming it in real time first and timing from the end of
-the clip. `tinywispr-test.exe --unit out.txt` checks the correction learner and the echo filter.
+the clip. `tinywispr-test.exe --unit out.txt` checks the correction learner, the echo filter, `# misheard as`
+parsing and how the watcher finds an edited paste. `TW_LOG=1` makes `--test` and `TW_FAKE` runs write
+to the dictation log (point `LOCALAPPDATA` somewhere else to keep it out of the real one).
 In the test build, `TW_LIVE_BREAK`, `TW_LIVE_MODEL=<bad model>`, `TW_LIVE_TIMEOUT` and
 `TW_LIVE_CANCEL` force each way the stream can fail. `--trim in.wav out.wav stats.txt` runs a clip
 through the speech detector offline, and `--mic-vad seconds stats.txt` runs it on the live
